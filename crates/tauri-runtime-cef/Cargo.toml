@@ -51,7 +51,7 @@ gtk = { version = "0.18", features = ["v3_24"] }
 x11-dl = "2.21"
 
 [features]
-default = ["sandbox"]
+default = []
 devtools = []
 macos-private-api = ["tauri-runtime/macos-private-api"]
 sandbox = ["cef/sandbox"]

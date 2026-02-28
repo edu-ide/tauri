@@ -2080,6 +2080,12 @@ impl<T: UserEvent> CefRuntime<T> {
       }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+      command_line_args.push(("--use-mock-keychain".to_string(), None));
+      command_line_args.push(("--password-store".to_string(), Some("basic".to_string())));
+    }
+
     let mut app = cef_impl::TauriApp::new(
       cef_context.clone(),
       runtime_args.custom_schemes,
@@ -2108,17 +2114,27 @@ impl<T: UserEvent> CefRuntime<T> {
     let settings = cef::Settings {
       no_sandbox: !cfg!(feature = "sandbox") as i32,
       cache_path: cache_path.to_string_lossy().to_string().as_str().into(),
+      #[cfg(target_os = "macos")]
+      framework_dir_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework").to_string_lossy().to_string().as_str().into(),
+      #[cfg(target_os = "macos")]
+      main_bundle_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework").to_string_lossy().to_string().as_str().into(),
+      browser_subprocess_path: std::env::current_exe().unwrap().to_string_lossy().to_string().as_str().into(),
+      resources_dir_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework/Resources").to_string_lossy().to_string().as_str().into(),
+      locales_dir_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework/Resources/en.lproj").to_string_lossy().to_string().as_str().into(),
+      log_severity: cef::LogSeverity::VERBOSE,
+      log_file: std::env::current_exe().unwrap().parent().unwrap().join("cef.log").to_string_lossy().to_string().as_str().into(),
       ..Default::default()
     };
-    assert_eq!(
-      cef::initialize(
-        Some(args.as_main_args()),
-        Some(&settings),
-        Some(&mut app),
-        std::ptr::null_mut()
-      ),
-      1
+    let init_result = cef::initialize(
+      Some(args.as_main_args()),
+      Some(&settings),
+      Some(&mut app),
+      std::ptr::null_mut()
     );
+
+    if init_result != 1 {
+      panic!("cef_initialize failed! CEF refused to initialize. This often happens if another instance of 'tauri dev' is already running and holding the CEF cache lock. Please kill any other running instances.");
+    }
 
     let main_thread_id = thread::current().id();
     let context = RuntimeContext {
