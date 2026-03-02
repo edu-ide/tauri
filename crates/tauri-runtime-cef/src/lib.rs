@@ -2463,6 +2463,9 @@ fn init_ns_app(on_event: Box<dyn Fn(AppDelegateEvent)>) {
     use objc2::runtime::ProtocolObject;
 
     let app: Retained<NSApplication> = msg_send![SimpleApplication::class(), sharedApplication];
+    // Bare binaries (not .app bundles) default to background activation policy.
+    // We must explicitly set Regular to show Dock icon and windows.
+    app.setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Regular);
     let delegate = AppDelegate::new(mtm, on_event);
     let proto_delegate = ProtocolObject::from_ref(&*delegate);
     app.setDelegate(Some(&proto_delegate));
