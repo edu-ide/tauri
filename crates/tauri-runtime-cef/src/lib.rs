@@ -32,6 +32,7 @@ use std::{
   collections::HashMap,
   fmt,
   fs::create_dir_all,
+  path::PathBuf,
   sync::{
     atomic::AtomicBool,
     mpsc::{channel, Sender},
@@ -2111,18 +2112,35 @@ impl<T: UserEvent> CefRuntime<T> {
       std::process::exit(0);
     }
 
+    let current_exe = std::env::current_exe().unwrap();
+    let current_exe_dir = current_exe.parent().unwrap().to_path_buf();
+    #[cfg(target_os = "linux")]
+    let cef_runtime_dir = std::env::var_os("CEF_PATH")
+      .map(PathBuf::from)
+      .unwrap_or_else(|| current_exe_dir.clone());
+    #[cfg(target_os = "linux")]
+    let cef_resources_dir = cef_runtime_dir.clone();
+    #[cfg(target_os = "linux")]
+    let cef_locales_dir = cef_runtime_dir.join("locales");
+
     let settings = cef::Settings {
       no_sandbox: !cfg!(feature = "sandbox") as i32,
       cache_path: cache_path.to_string_lossy().to_string().as_str().into(),
       #[cfg(target_os = "macos")]
-      framework_dir_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework").to_string_lossy().to_string().as_str().into(),
+      framework_dir_path: current_exe_dir.join("Frameworks/Chromium Embedded Framework.framework").to_string_lossy().to_string().as_str().into(),
       #[cfg(target_os = "macos")]
-      main_bundle_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework").to_string_lossy().to_string().as_str().into(),
-      browser_subprocess_path: std::env::current_exe().unwrap().to_string_lossy().to_string().as_str().into(),
-      resources_dir_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework/Resources").to_string_lossy().to_string().as_str().into(),
-      locales_dir_path: std::env::current_exe().unwrap().parent().unwrap().join("Frameworks/Chromium Embedded Framework.framework/Resources/en.lproj").to_string_lossy().to_string().as_str().into(),
+      main_bundle_path: current_exe_dir.join("Frameworks/Chromium Embedded Framework.framework").to_string_lossy().to_string().as_str().into(),
+      browser_subprocess_path: current_exe.to_string_lossy().to_string().as_str().into(),
+      #[cfg(target_os = "macos")]
+      resources_dir_path: current_exe_dir.join("Frameworks/Chromium Embedded Framework.framework/Resources").to_string_lossy().to_string().as_str().into(),
+      #[cfg(target_os = "macos")]
+      locales_dir_path: current_exe_dir.join("Frameworks/Chromium Embedded Framework.framework/Resources/en.lproj").to_string_lossy().to_string().as_str().into(),
+      #[cfg(target_os = "linux")]
+      resources_dir_path: cef_resources_dir.to_string_lossy().to_string().as_str().into(),
+      #[cfg(target_os = "linux")]
+      locales_dir_path: cef_locales_dir.to_string_lossy().to_string().as_str().into(),
       log_severity: cef::LogSeverity::VERBOSE,
-      log_file: std::env::current_exe().unwrap().parent().unwrap().join("cef.log").to_string_lossy().to_string().as_str().into(),
+      log_file: current_exe_dir.join("cef.log").to_string_lossy().to_string().as_str().into(),
       ..Default::default()
     };
     let init_result = cef::initialize(
