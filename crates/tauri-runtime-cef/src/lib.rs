@@ -2098,6 +2098,9 @@ impl<T: UserEvent> CefRuntime<T> {
       command_line_args.push(("--password-store".to_string(), Some("basic".to_string())));
     }
 
+    // Agent/MCP 자동화를 위한 CDP(Chrome DevTools Protocol) 개방
+    command_line_args.push(("--remote-debugging-port".to_string(), Some("18801".to_string())));
+
     let mut app = cef_impl::TauriApp::new(
       cef_context.clone(),
       runtime_args.custom_schemes,
