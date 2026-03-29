@@ -9,7 +9,7 @@ use std::{
 };
 
 use cef::{rc::*, *};
-use dioxus_debug_cell::RefCell;
+use crate::thread_safe_cell::RefCell;
 use html5ever::{interface::QualName, namespace_url, ns, LocalName};
 use http::{
   header::{CONTENT_SECURITY_POLICY, CONTENT_TYPE},

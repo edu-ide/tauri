@@ -4,7 +4,7 @@
 
 use base64::Engine;
 use cef::{rc::*, *};
-use dioxus_debug_cell::RefCell;
+use crate::thread_safe_cell::RefCell;
 use sha2::{Digest, Sha256};
 use std::{
   collections::HashMap,

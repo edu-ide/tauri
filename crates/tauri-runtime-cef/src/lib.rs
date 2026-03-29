@@ -27,7 +27,8 @@ use url::Url;
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
 
-use dioxus_debug_cell::RefCell;
+pub mod thread_safe_cell;
+use crate::thread_safe_cell::RefCell;
 use std::{
   collections::HashMap,
   fmt,
@@ -2047,26 +2048,36 @@ impl<T: UserEvent> CefRuntime<T> {
         append_switch_if_absent(&mut command_line_args, "enable-zero-copy");
         // Auto-detect display server and set ozone platform accordingly.
         let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-        if session_type == "wayland" {
+        if session_type == "wayland" && !std::env::var("WAYLAND_DISPLAY").unwrap_or_default().is_empty() {
           set_switch_value_if_absent(&mut command_line_args, "ozone-platform", "wayland");
-          // Use ANGLE with OpenGL backend for GPU compositing on Wayland + NVIDIA.
-          set_switch_value_if_absent(&mut command_line_args, "use-angle", "opengl");
+          // Use default ANGLE with EGL/OpenGL backend for GPU compositing on Wayland + NVIDIA.
         } else {
           // Keep GPU acceleration on X11/GL while avoiding the Vulkan crash path.
           set_switch_value_if_absent(&mut command_line_args, "ozone-platform", "x11");
         }
         append_switch_if_absent(&mut command_line_args, "disable-vulkan");
+        append_switch_if_absent(&mut command_line_args, "disable-gpu-vulkan");
+        extend_switch_value(
+          &mut command_line_args,
+          "disable-features",
+          "Vulkan",
+        );
       } else {
         // Default safe GPU mode: use ANGLE with OpenGL backend for hardware acceleration
         // while avoiding the broken default GL=none path and Vulkan crashes.
         let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-        if session_type == "wayland" {
+        if session_type == "wayland" && !std::env::var("WAYLAND_DISPLAY").unwrap_or_default().is_empty() {
           set_switch_value_if_absent(&mut command_line_args, "ozone-platform", "wayland");
         } else {
           set_switch_value_if_absent(&mut command_line_args, "ozone-platform", "x11");
         }
-        set_switch_value_if_absent(&mut command_line_args, "use-angle", "opengl");
         append_switch_if_absent(&mut command_line_args, "disable-vulkan");
+        append_switch_if_absent(&mut command_line_args, "disable-gpu-vulkan");
+        extend_switch_value(
+          &mut command_line_args,
+          "disable-features",
+          "Vulkan",
+        );
         append_switch_if_absent(&mut command_line_args, "ignore-gpu-blocklist");
         extend_switch_value(
           &mut command_line_args,
