@@ -2099,7 +2099,8 @@ impl<T: UserEvent> CefRuntime<T> {
     }
 
     // Agent/MCP 자동화를 위한 CDP(Chrome DevTools Protocol) 개방
-    command_line_args.push(("--remote-debugging-port".to_string(), Some("18801".to_string())));
+    command_line_args.push(("--remote-debugging-port".to_string(), Some("19222".to_string())));
+    command_line_args.push(("--remote-debugging-address".to_string(), Some("127.0.0.1".to_string())));
 
     let mut app = cef_impl::TauriApp::new(
       cef_context.clone(),
