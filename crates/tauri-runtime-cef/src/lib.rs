@@ -2098,9 +2098,13 @@ impl<T: UserEvent> CefRuntime<T> {
       command_line_args.push(("--password-store".to_string(), Some("basic".to_string())));
     }
 
-    // Agent/MCP 자동화를 위한 CDP(Chrome DevTools Protocol) 개방
-    command_line_args.push(("--remote-debugging-port".to_string(), Some("19222".to_string())));
-    command_line_args.push(("--remote-debugging-address".to_string(), Some("127.0.0.1".to_string())));
+    // Agent/MCP 자동화를 위한 CDP(Chrome DevTools Protocol) 개방.
+    // 기본 19222(이전과 동일). CEF 앱 둘이 동시에 뜨면 충돌하므로 TAURI_CEF_REMOTE_DEBUGGING_PORT 로 바꾼다(0 = 끔).
+    let cdp_port = std::env::var("TAURI_CEF_REMOTE_DEBUGGING_PORT").ok().unwrap_or_else(|| "19222".to_string());
+    if cdp_port != "0" {
+      command_line_args.push(("--remote-debugging-port".to_string(), Some(cdp_port)));
+      command_line_args.push(("--remote-debugging-address".to_string(), Some("127.0.0.1".to_string())));
+    }
 
     let mut app = cef_impl::TauriApp::new(
       cef_context.clone(),
