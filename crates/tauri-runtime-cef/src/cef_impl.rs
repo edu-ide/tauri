@@ -3374,13 +3374,28 @@ pub(crate) fn create_webview<T: UserEvent>(
   });
 
   let window_handle = window.window_handle();
+  let browser_runtime_style = platform_specific_attributes
+    .iter()
+    .find_map(|attr| match attr {
+      WebviewAtribute::RuntimeStyle { style } => Some(*style),
+    })
+    .unwrap_or(CefRuntimeStyle::Alloy);
 
   if kind == WebviewKind::WindowChild {
     #[cfg(target_os = "macos")]
     let window_handle = ensure_valid_content_view(window_handle);
 
-    let window_info = cef::WindowInfo::default()
-      .set_as_child(window_handle, bounds.as_ref().unwrap_or(&Rect::default()));
+    // Child windows must use the same explicit style as BrowserViews. CEF's
+    // DEFAULT selects Chrome style, whose embedded ContentsWebView forces a
+    // transparent renderer background in Chromium 144 even for opaque settings.
+    let window_info = cef::WindowInfo {
+      runtime_style: match browser_runtime_style {
+        CefRuntimeStyle::Alloy => cef::sys::cef_runtime_style_t::CEF_RUNTIME_STYLE_ALLOY.into(),
+        CefRuntimeStyle::Chrome => cef::sys::cef_runtime_style_t::CEF_RUNTIME_STYLE_CHROME.into(),
+      },
+      ..Default::default()
+    }
+    .set_as_child(window_handle, bounds.as_ref().unwrap_or(&Rect::default()));
 
     let Some(browser) = browser_host_create_browser_sync(
       Some(&window_info),
@@ -3443,15 +3458,8 @@ pub(crate) fn create_webview<T: UserEvent>(
       });
   } else {
     let browser_id = Arc::new(RefCell::new(0));
-    let mut browser_view_delegate = BrowserViewDelegateImpl::new(
-      browser_id.clone(),
-      platform_specific_attributes
-        .iter()
-        .find_map(|attr| match attr {
-          WebviewAtribute::RuntimeStyle { style } => Some(*style),
-        })
-        .unwrap_or(CefRuntimeStyle::Alloy),
-    );
+    let mut browser_view_delegate =
+      BrowserViewDelegateImpl::new(browser_id.clone(), browser_runtime_style);
 
     let browser_view = browser_view_create(
       Some(&mut client),
