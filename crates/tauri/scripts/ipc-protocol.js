@@ -57,6 +57,19 @@
             window.__TAURI_INTERNALS__.runCallback(callbackId, data)
           },
           (e) => {
+            // CEF uses the custom protocol without a native postMessage bridge.
+            // A transient fetch/body failure must not poison every later invoke.
+            // Do not replay this command: the native handler may have run before
+            // its response was interrupted. Reject it and let the next call use
+            // the custom protocol normally.
+            if (typeof window.ipc?.postMessage !== 'function') {
+              console.warn('IPC custom protocol request failed', e)
+              window.__TAURI_INTERNALS__.runCallback(
+                error,
+                'IPC custom protocol request failed; no postMessage transport is available. The command was not retried.'
+              )
+              return
+            }
             console.warn(
               'IPC custom protocol failed, Tauri will now use the postMessage interface instead',
               e
