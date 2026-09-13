@@ -126,6 +126,19 @@ const MAX_RENDERER_RECOVERIES: usize = 3;
 #[derive(Default)]
 pub struct RendererRecoveryState {
   attempts: VecDeque<Instant>,
+  pending: Option<u64>,
+  generation: u64,
+  closed: bool,
+  observer_browser_id: Option<i32>,
+  subscription_queued: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryDecision {
+  Queued { generation: u64, attempt: usize },
+  Pending,
+  Exhausted,
+  Closed,
 }
 
 impl RendererRecoveryState {
@@ -141,6 +154,46 @@ impl RendererRecoveryState {
     }
     self.attempts.push_back(now);
     Some(self.attempts.len())
+  }
+
+  fn queue_recovery(&mut self, now: Instant) -> RecoveryDecision {
+    if self.closed {
+      return RecoveryDecision::Closed;
+    }
+    if self.pending.is_some() {
+      return RecoveryDecision::Pending;
+    }
+    let Some(attempt) = self.reserve_attempt(now) else {
+      return RecoveryDecision::Exhausted;
+    };
+    self.generation = self.generation.wrapping_add(1);
+    self.pending = Some(self.generation);
+    RecoveryDecision::Queued { generation: self.generation, attempt }
+  }
+
+  fn finish_recovery(&mut self, generation: u64) {
+    if self.pending == Some(generation) {
+      self.pending = None;
+    }
+  }
+
+  fn matches_browser(&self, browser_id: i32) -> bool {
+    self.observer_browser_id.map_or(true, |id| id == browser_id)
+  }
+
+  fn queue_subscription(&mut self, browser_id: i32) -> bool {
+    if self.closed || self.observer_browser_id != Some(browser_id) || self.subscription_queued {
+      return false;
+    }
+    self.subscription_queued = true;
+    true
+  }
+
+  fn close(&mut self) {
+    self.closed = true;
+    self.pending = None;
+    self.observer_browser_id = None;
+    self.subscription_queued = false;
   }
 }
 
@@ -176,19 +229,27 @@ wrap_task! {
   struct RecoverInternalRendererTask {
     browser: Browser,
     origin: Url,
+    renderer_recovery: Arc<Mutex<RendererRecoveryState>>,
+    generation: u64,
   }
 
   impl Task {
     fn execute(&self) {
-      if self.browser.is_valid() == 0 {
+      let should_run = self.renderer_recovery.lock().is_ok_and(|recovery| {
+        !recovery.closed && recovery.pending == Some(self.generation)
+      });
+      if !should_run {
         return;
       }
-      let Some(frame) = self.browser.main_frame() else {
-        return;
-      };
       // A navigation or close may have happened while this UI task was queued.
-      let current_url = CefString::from(&frame.url()).to_string();
-      if !matches_recovery_origin(&self.origin, &current_url) {
+      let same_origin = self.browser.is_valid() != 0
+        && self.browser.main_frame().is_some_and(|frame| {
+          matches_recovery_origin(&self.origin, &CefString::from(&frame.url()).to_string())
+        });
+      if !same_origin {
+        if let Ok(mut recovery) = self.renderer_recovery.lock() {
+          recovery.finish_recovery(self.generation);
+        }
         return;
       }
       eprintln!(
@@ -200,6 +261,179 @@ wrap_task! {
   }
 }
 
+fn queue_internal_renderer_recovery(
+  browser: &Browser,
+  origin: &Url,
+  renderer_recovery: &Arc<Mutex<RendererRecoveryState>>,
+  source: &str,
+) {
+  if std::env::var("TAURI_CEF_RECOVER_APP_RENDERERS").as_deref() != Ok("1")
+    || browser.is_valid() == 0
+  {
+    return;
+  }
+  let Some(frame) = browser.main_frame() else { return; };
+  if !matches_recovery_origin(origin, &CefString::from(&frame.url()).to_string()) {
+    return;
+  }
+  let browser_id = browser.identifier();
+  let decision = match renderer_recovery.lock() {
+    Ok(mut recovery) => {
+      if !recovery.matches_browser(browser_id) {
+        return;
+      }
+      recovery.queue_recovery(Instant::now())
+    }
+    Err(_) => {
+      eprintln!("[tauri-cef] renderer recovery state unavailable: browser_id={browser_id} source={source}");
+      return;
+    }
+  };
+  let (generation, attempt) = match decision {
+    RecoveryDecision::Queued { generation, attempt } => (generation, attempt),
+    RecoveryDecision::Pending => {
+      eprintln!("[tauri-cef] renderer recovery already pending: browser_id={browser_id} source={source}");
+      return;
+    }
+    RecoveryDecision::Exhausted => {
+      eprintln!("[tauri-cef] renderer recovery suppressed: browser_id={browser_id} limit={MAX_RENDERER_RECOVERIES}/60s source={source}");
+      return;
+    }
+    RecoveryDecision::Closed => return,
+  };
+  eprintln!("[tauri-cef] renderer recovery queued: browser_id={browser_id} attempt={attempt}/{MAX_RENDERER_RECOVERIES} source={source}");
+  // Both crash notifications can arrive for one renderer. Keep the shared
+  // pending generation until CEF reports the replacement render view ready.
+  let mut task = RecoverInternalRendererTask::new(
+    browser.clone(), origin.clone(), renderer_recovery.clone(), generation,
+  );
+  if cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task)) == 0 {
+    if let Ok(mut recovery) = renderer_recovery.lock() {
+      recovery.finish_recovery(generation);
+    }
+    eprintln!("[tauri-cef] renderer recovery task rejected: browser_id={browser_id} source={source}");
+  }
+}
+
+wrap_task! {
+  struct SubscribeRendererCrashTask {
+    browser: Browser,
+    renderer_recovery: Arc<Mutex<RendererRecoveryState>>,
+  }
+
+  impl Task {
+    fn execute(&self) {
+      let should_run = match self.renderer_recovery.lock() {
+        Ok(mut recovery) => {
+          recovery.subscription_queued = false;
+          !recovery.closed && recovery.observer_browser_id == Some(self.browser.identifier())
+        }
+        Err(_) => false,
+      };
+      if !should_run || self.browser.is_valid() == 0 {
+        return;
+      }
+      let Some(host) = self.browser.host() else { return; };
+      if host.execute_dev_tools_method(0, Some(&CefString::from("Inspector.enable")), None) == 0 {
+        eprintln!("[tauri-cef] renderer crash observer subscription rejected: browser_id={}", self.browser.identifier());
+      }
+    }
+  }
+}
+
+fn queue_renderer_crash_subscription(
+  browser: &Browser,
+  renderer_recovery: &Arc<Mutex<RendererRecoveryState>>,
+) {
+  let browser_id = browser.identifier();
+  if !renderer_recovery.lock().is_ok_and(|mut recovery| recovery.queue_subscription(browser_id)) {
+    return;
+  }
+  let mut task = SubscribeRendererCrashTask::new(browser.clone(), renderer_recovery.clone());
+  if cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task)) == 0 {
+    if let Ok(mut recovery) = renderer_recovery.lock() {
+      recovery.subscription_queued = false;
+    }
+  }
+}
+
+wrap_dev_tools_message_observer! {
+  struct InternalRendererCrashObserver {
+    origin: Url,
+    renderer_recovery: Arc<Mutex<RendererRecoveryState>>,
+  }
+
+  impl DevToolsMessageObserver {
+    fn on_dev_tools_event(
+      &self,
+      browser: Option<&mut Browser>,
+      method: Option<&CefString>,
+      _params: Option<&[u8]>,
+    ) {
+      let Some(browser) = browser else { return; };
+      if method.is_some_and(|method| method.to_string() == "Inspector.targetCrashed") {
+        eprintln!("[tauri-cef] renderer crash observed: browser_id={} source=Inspector.targetCrashed", browser.identifier());
+        queue_internal_renderer_recovery(browser, &self.origin, &self.renderer_recovery, "Inspector.targetCrashed");
+      }
+    }
+
+    fn on_dev_tools_agent_detached(&self, browser: Option<&mut Browser>) {
+      // CEF cancels event subscriptions on detach. Re-enable in a separate UI
+      // task; on_before_close marks the shared state closed before cleanup so
+      // a closing browser cannot be reattached by a queued task.
+      if let Some(browser) = browser {
+        queue_renderer_crash_subscription(browser, &self.renderer_recovery);
+      }
+    }
+  }
+}
+
+pub(super) fn install_renderer_crash_observer(
+  browser: &Browser,
+  origin: Option<&Url>,
+  renderer_recovery: &Arc<Mutex<RendererRecoveryState>>,
+  registration: &Arc<RefCell<Option<Registration>>>,
+) {
+  if std::env::var("TAURI_CEF_RECOVER_APP_RENDERERS").as_deref() != Ok("1") {
+    return;
+  }
+  let Some(origin) = origin else { return; };
+  let Some(host) = browser.host() else { return; };
+  if registration.borrow().is_some() {
+    return;
+  }
+  let mut observer = InternalRendererCrashObserver::new(origin.clone(), renderer_recovery.clone());
+  let Some(observer_registration) = host.add_dev_tools_message_observer(Some(&mut observer)) else {
+    eprintln!("[tauri-cef] renderer crash observer registration rejected: browser_id={}", browser.identifier());
+    return;
+  };
+  // Retain the Registration for the browser lifetime, separately from the state
+  // held by the observer, so it does not create a reference cycle.
+  *registration.borrow_mut() = Some(observer_registration);
+  if let Ok(mut recovery) = renderer_recovery.lock() {
+    recovery.observer_browser_id = Some(browser.identifier());
+  }
+  queue_renderer_crash_subscription(browser, renderer_recovery);
+}
+
+pub(super) fn close_renderer_crash_observer(
+  browser: &Browser,
+  renderer_recovery: &Arc<Mutex<RendererRecoveryState>>,
+  registration: &Arc<RefCell<Option<Registration>>>,
+) {
+  if let Ok(mut recovery) = renderer_recovery.lock() {
+    // CEF may reuse a Client for a popup. Closing that popup must not unregister
+    // the original browser's observer or cancel its pending recovery.
+    if !recovery.matches_browser(browser.identifier()) {
+      return;
+    }
+    recovery.close();
+  }
+  let observer_registration = registration.borrow_mut().take();
+  // Dropping a registration may call CEF. Release our state/slot locks first.
+  drop(observer_registration);
+}
+
 wrap_request_handler! {
   pub struct WebRequestHandler {
     initialization_scripts: Arc<Vec<CefInitScript>>,
@@ -209,6 +443,17 @@ wrap_request_handler! {
   }
 
   impl RequestHandler {
+    fn on_render_view_ready(&self, browser: Option<&mut Browser>) {
+      let Some(browser) = browser else { return; };
+      if let Ok(mut recovery) = self.renderer_recovery.lock() {
+        if !recovery.matches_browser(browser.identifier()) {
+          return;
+        }
+        recovery.pending = None;
+      }
+      queue_renderer_crash_subscription(browser, &self.renderer_recovery);
+    }
+
     fn on_render_process_terminated(
       &self,
       browser: Option<&mut Browser>,
@@ -223,46 +468,10 @@ wrap_request_handler! {
       eprintln!(
         "[tauri-cef] renderer terminated: browser_id={browser_id} status={status:?} error_code={error_code}"
       );
-      // Other Tauri applications may own unsaved documents. Recovery is opt-in
-      // for applications that can safely reconstruct their internal views.
-      if std::env::var("TAURI_CEF_RECOVER_APP_RENDERERS").as_deref() != Ok("1") {
-        return;
-      }
       let Some(origin) = &self.recovery_origin else {
         return;
       };
-      if browser.is_valid() == 0 {
-        return;
-      }
-      let Some(frame) = browser.main_frame() else {
-        return;
-      };
-      let current_url = CefString::from(&frame.url()).to_string();
-      if !matches_recovery_origin(origin, &current_url) {
-        return;
-      }
-      let attempt = match self.renderer_recovery.lock() {
-        Ok(mut recovery) => recovery.reserve_attempt(Instant::now()),
-        Err(_) => {
-          eprintln!("[tauri-cef] renderer recovery state unavailable: browser_id={browser_id}");
-          return;
-        }
-      };
-      let Some(attempt) = attempt else {
-        eprintln!(
-          "[tauri-cef] renderer recovery suppressed: browser_id={browser_id} limit={MAX_RENDERER_RECOVERIES}/60s"
-        );
-        return;
-      };
-      eprintln!(
-        "[tauri-cef] renderer recovery queued: browser_id={browser_id} attempt={attempt}/{MAX_RENDERER_RECOVERIES}"
-      );
-      // Reloading within the termination callback can reenter CEF while it tears
-      // down the old renderer. Run it in a separate UI task instead.
-      let mut task = RecoverInternalRendererTask::new(browser.clone(), origin.clone());
-      if cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task)) == 0 {
-        eprintln!("[tauri-cef] renderer recovery task rejected: browser_id={browser_id}");
-      }
+      queue_internal_renderer_recovery(browser, origin, &self.renderer_recovery, "OnRenderProcessTerminated");
     }
 
     fn on_before_browse(
@@ -665,5 +874,54 @@ mod renderer_recovery_tests {
     }
     assert_eq!(client_state.lock().unwrap().reserve_attempt(now), None);
     assert_eq!(RendererRecoveryState::default().reserve_attempt(now), Some(1));
+  }
+
+  #[test]
+  fn duplicate_crash_sources_queue_one_reload_and_consume_one_attempt() {
+    let shared = Arc::new(Mutex::new(RendererRecoveryState::default()));
+    let native_observer = shared.clone();
+    let termination_callback = shared.clone();
+    let now = Instant::now();
+    assert_eq!(
+      native_observer.lock().unwrap().queue_recovery(now),
+      RecoveryDecision::Queued { generation: 1, attempt: 1 }
+    );
+    assert_eq!(
+      termination_callback.lock().unwrap().queue_recovery(now),
+      RecoveryDecision::Pending
+    );
+    let mut state = shared.lock().unwrap();
+    assert_eq!(state.attempts.len(), 1);
+    state.finish_recovery(1);
+    assert_eq!(state.queue_recovery(now), RecoveryDecision::Queued { generation: 2, attempt: 2 });
+    // A delayed cancellation from an old queued task must not clear the new one.
+    state.finish_recovery(1);
+    assert_eq!(state.queue_recovery(now), RecoveryDecision::Pending);
+    state.finish_recovery(2);
+    assert_eq!(state.queue_recovery(now), RecoveryDecision::Queued { generation: 3, attempt: 3 });
+    state.finish_recovery(3);
+    assert_eq!(state.queue_recovery(now), RecoveryDecision::Exhausted);
+  }
+
+  #[test]
+  fn close_cancels_pending_recovery_and_prevents_detach_reattachment() {
+    let mut state = RendererRecoveryState::default();
+    let now = Instant::now();
+    assert!(!state.queue_subscription(7));
+    state.observer_browser_id = Some(7);
+    assert!(!state.matches_browser(8));
+    assert!(!state.queue_subscription(8));
+    assert!(state.queue_subscription(7));
+    assert!(!state.queue_subscription(7));
+    // After the subscription task runs, a later detach may subscribe again.
+    state.subscription_queued = false;
+    assert!(state.queue_subscription(7));
+    assert_eq!(state.queue_recovery(now), RecoveryDecision::Queued { generation: 1, attempt: 1 });
+    state.close();
+    assert_eq!(state.pending, None);
+    assert_eq!(state.observer_browser_id, None);
+    assert!(!state.subscription_queued);
+    assert!(!state.queue_subscription(7));
+    assert_eq!(state.queue_recovery(now + Duration::from_secs(61)), RecoveryDecision::Closed);
   }
 }

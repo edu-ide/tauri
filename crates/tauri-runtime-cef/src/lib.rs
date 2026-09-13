@@ -227,6 +227,7 @@ pub enum WebviewMessage {
   ClearAllBrowsingData,
   // Getters
   Url(Sender<Result<String>>),
+  DevToolsTargetId(Sender<Result<Option<String>>>),
   Bounds(Sender<Result<Rect>>),
   Position(Sender<Result<PhysicalPosition<i32>>>),
   Size(Sender<Result<PhysicalSize<u32>>>),
@@ -257,6 +258,7 @@ pub(crate) struct AppWebview {
   // browser_view.browser is null on the scheme handler factory,
   // so we need to use the browser_id to identify the browser
   pub browser_id: Arc<RefCell<i32>>,
+  pub devtools_target: Arc<RefCell<Option<cef_impl::devtools_target::NativeDevToolsTarget>>>,
   pub bounds: Arc<Mutex<Option<WebviewBounds>>>,
   #[allow(unused)]
   pub devtools_enabled: bool,
@@ -1110,6 +1112,10 @@ impl<T: UserEvent> WebviewDispatch<T> for CefWebviewDispatcher<T> {
 
   fn url(&self) -> Result<String> {
     webview_getter!(self, WebviewMessage::Url)?
+  }
+
+  fn devtools_target_id(&self) -> Result<Option<String>> {
+    webview_getter!(self, WebviewMessage::DevToolsTargetId)?
   }
 
   fn bounds(&self) -> Result<Rect> {

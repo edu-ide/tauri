@@ -1726,6 +1726,15 @@ tauri::Builder::default()
       .map(|url| url.parse().map_err(crate::Error::InvalidUrl))?
   }
 
+  /// Returns this webview's native DevTools target ID, when available.
+  ///
+  /// This identifies the native webview, independently of its URL or title.
+  /// Returns `None` when the runtime does not support target identification or
+  /// its asynchronous native lookup has not completed yet.
+  pub fn devtools_target_id(&self) -> crate::Result<Option<String>> {
+    self.webview.dispatcher.devtools_target_id().map_err(Into::into)
+  }
+
   /// Navigates the webview to the defined url.
   pub fn navigate(&self, url: Url) -> crate::Result<()> {
     self.webview.dispatcher.navigate(url).map_err(Into::into)

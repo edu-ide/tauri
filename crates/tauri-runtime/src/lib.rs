@@ -569,6 +569,14 @@ pub trait WebviewDispatch<T: UserEvent>: Debug + Clone + Send + Sync + Sized + '
   /// Returns the webview's current URL.
   fn url(&self) -> Result<String>;
 
+  /// Returns this webview's native DevTools target ID, when available.
+  ///
+  /// Runtimes without native target identification return `None`. A runtime
+  /// resolving the ID asynchronously may also return `None` until it is ready.
+  fn devtools_target_id(&self) -> Result<Option<String>> {
+    Ok(None)
+  }
+
   /// Returns the webview's bounds.
   fn bounds(&self) -> Result<Rect>;
 

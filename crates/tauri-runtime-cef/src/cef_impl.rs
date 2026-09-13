@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod cookie;
+pub(crate) mod devtools_target;
 mod drag_window;
 pub mod request_handler;
 
@@ -808,11 +809,20 @@ wrap_life_span_handler! {
     context: Context<T>,
     new_window_handler: Option<Arc<tauri_runtime::webview::NewWindowHandler<T, crate::CefRuntime<T>>>>,
     initial_url: Option<String>,
+    recovery_origin: Option<url::Url>,
+    renderer_recovery: Arc<Mutex<request_handler::RendererRecoveryState>>,
+    renderer_crash_registration: Arc<RefCell<Option<Registration>>>,
   }
 
   impl LifeSpanHandler {
     fn on_after_created(&self, browser: Option<&mut Browser>) {
       if let Some(browser) = browser {
+        request_handler::install_renderer_crash_observer(
+          browser,
+          self.recovery_origin.as_ref(),
+          &self.renderer_recovery,
+          &self.renderer_crash_registration,
+        );
         if let Some(initial_url) = &self.initial_url {
           check_and_reload_if_blank(browser.clone(), initial_url.clone());
         }
@@ -820,6 +830,13 @@ wrap_life_span_handler! {
     }
 
     fn on_before_close(&self, browser: Option<&mut Browser>) {
+      if let Some(browser) = browser.as_deref() {
+        request_handler::close_renderer_crash_observer(
+          browser,
+          &self.renderer_recovery,
+          &self.renderer_crash_registration,
+        );
+      }
       match self.window_kind {
         WindowKind::Browser => {
           on_window_destroyed(self.window_id, &self.context);
@@ -952,6 +969,7 @@ wrap_client! {
     context: Context<T>,
     initial_url: Option<String>,
     renderer_recovery: Arc<Mutex<request_handler::RendererRecoveryState>>,
+    renderer_crash_registration: Arc<RefCell<Option<Registration>>>,
   }
 
   impl Client {
@@ -975,6 +993,13 @@ wrap_client! {
         self.context.clone(),
         self.new_window_handler.clone(),
         self.initial_url.clone(),
+        request_handler::renderer_recovery_origin(
+          self.initial_url.as_deref(),
+          &self.custom_scheme_domain_names,
+          &self.custom_protocol_scheme,
+        ),
+        self.renderer_recovery.clone(),
+        self.renderer_crash_registration.clone(),
       ))
     }
 
@@ -1832,6 +1857,25 @@ fn handle_webview_message<T: UserEvent>(
       let result = get_main_frame(context, window_id, webview_id)
         .map(|frame| cef::CefString::from(&frame.url()).to_string())
         .ok_or(tauri_runtime::Error::FailedToSendMessage);
+      let _ = tx.send(result);
+    }
+    WebviewMessage::DevToolsTargetId(tx) => {
+      let result = get_webview(context, window_id, webview_id)
+        .ok_or(tauri_runtime::Error::FailedToSendMessage)
+        .map(|webview| {
+          let Some(browser) = webview.inner.browser() else { return None; };
+          if browser.is_valid() == 0 {
+            return None;
+          }
+          let mut target = webview.devtools_target.borrow_mut();
+          if target.as_ref().is_some_and(|target| target.browser_id() != browser.identifier()) {
+            *target = None;
+          }
+          if target.is_none() {
+            *target = devtools_target::NativeDevToolsTarget::new(&browser);
+          }
+          target.as_ref().and_then(|target| target.target_id(&browser))
+        });
       let _ = tx.send(result);
     }
     WebviewMessage::Bounds(tx) => {
@@ -2986,6 +3030,7 @@ fn create_browser_window<T: UserEvent>(
     context.clone(),
     Some(initial_url),
     Arc::new(Mutex::new(request_handler::RendererRecoveryState::default())),
+    Arc::new(RefCell::new(None)),
   );
 
   let mut bounds = cef::Rect {
@@ -3037,6 +3082,7 @@ fn create_browser_window<T: UserEvent>(
       webviews: vec![AppWebview {
         webview_id,
         browser_id: Arc::new(RefCell::new(browser.browser_id())),
+        devtools_target: Arc::new(RefCell::new(None)),
         label: webview_label,
         inner: browser,
         bounds: Arc::new(Mutex::new(None)),
@@ -3341,6 +3387,7 @@ pub(crate) fn create_webview<T: UserEvent>(
     context.clone(),
     Some(initial_url.clone()),
     Arc::new(Mutex::new(request_handler::RendererRecoveryState::default())),
+    Arc::new(RefCell::new(None)),
   );
 
   let uri_scheme_protocols: HashMap<String, Arc<Box<UriSchemeProtocolHandler>>> =
@@ -3461,6 +3508,7 @@ pub(crate) fn create_webview<T: UserEvent>(
         label,
         webview_id,
         browser_id: Arc::new(RefCell::new(browser.browser_id())),
+        devtools_target: Arc::new(RefCell::new(None)),
         bounds: Arc::new(Mutex::new(initial_bounds_ratio)),
         inner: browser,
         devtools_enabled,
@@ -3506,6 +3554,7 @@ pub(crate) fn create_webview<T: UserEvent>(
         label,
         webview_id,
         browser_id,
+        devtools_target: Arc::new(RefCell::new(None)),
         bounds: Arc::new(Mutex::new(None)),
         devtools_enabled,
         uri_scheme_protocols: Arc::new(uri_scheme_protocols),
