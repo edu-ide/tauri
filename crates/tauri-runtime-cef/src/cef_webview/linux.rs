@@ -137,23 +137,11 @@ impl CefBrowserExt for cef::Browser {
   }
 
   fn close(&self) {
-    let Some(xid) = self.xid() else {
-      return;
-    };
-
-    let Some(xlib) = X11.as_ref() else {
-      return;
-    };
-
-    unsafe {
-      let display = (xlib.XOpenDisplay)(std::ptr::null());
-      if display.is_null() {
-        return;
-      }
-
-      (xlib.XDestroyWindow)(display, xid as xlib::Window);
-      (xlib.XFlush)(display);
-      (xlib.XCloseDisplay)(display);
+    // Destroying the X11 window alone leaves the CEF browser and renderer alive.
+    // Hide immediately, then let CEF close its browser and native window together.
+    self.set_visible(0);
+    if let Some(host) = self.host() {
+      host.close_browser(1);
     }
   }
 

@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+use crate::thread_safe_cell::RefCell;
 use base64::Engine;
 use cef::{rc::*, *};
-use crate::thread_safe_cell::RefCell;
 use sha2::{Digest, Sha256};
 use std::{
   collections::HashMap,
@@ -1543,23 +1543,25 @@ fn handle_webview_message<T: UserEvent>(
       }
     }
     WebviewMessage::Close => {
-      if let Some(app_window) = context.windows.borrow_mut().get_mut(&window_id) {
-        let webview_index = app_window
-          .webviews
-          .iter()
-          .position(|w| w.webview_id == webview_id);
-
-        if let Some(index) = webview_index {
+      let browser_view_wrapper = {
+        let mut windows = context.windows.borrow_mut();
+        windows.get_mut(&window_id).and_then(|app_window| {
+          let index = app_window
+            .webviews
+            .iter()
+            .position(|w| w.webview_id == webview_id)?;
           let browser_view_wrapper = app_window.webviews.remove(index);
-
-          browser_view_wrapper.inner.close();
-
           app_window
             .webview_event_listeners
             .lock()
             .unwrap()
             .remove(&webview_id);
-        }
+          Some(browser_view_wrapper)
+        })
+      };
+      if let Some(browser_view_wrapper) = browser_view_wrapper {
+        // CEF may invoke OnBeforeClose while closing, which borrows windows again.
+        browser_view_wrapper.inner.close();
       }
     }
     WebviewMessage::Show => {
