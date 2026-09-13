@@ -9,6 +9,12 @@ mod windows;
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(target_os = "linux")]
+mod linux_stacking;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux_stacking::process_events as process_native_child_stacking_events;
+
 #[derive(Clone)]
 pub enum CefWebview {
   BrowserView(cef::BrowserView),

@@ -2474,6 +2474,9 @@ impl<T: UserEvent> Runtime<T> for CefRuntime<T> {
       // This processes one iteration of the message loop
       cef::do_message_loop_work();
 
+      #[cfg(target_os = "linux")]
+      crate::cef_webview::process_native_child_stacking_events();
+
       // Emit MainEventsCleared event
       (self.context.cef_context.callback.borrow())(RunEvent::MainEventsCleared);
     }

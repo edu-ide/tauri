@@ -4,7 +4,7 @@ use x11_dl::xlib;
 
 use crate::cef_webview::CefBrowserExt;
 
-static X11: LazyLock<Option<xlib::Xlib>> = LazyLock::new(|| xlib::Xlib::open().ok());
+pub(super) static X11: LazyLock<Option<xlib::Xlib>> = LazyLock::new(|| xlib::Xlib::open().ok());
 
 impl CefBrowserExt for cef::Browser {
   fn xid(&self) -> Option<u64> {
@@ -140,6 +140,9 @@ impl CefBrowserExt for cef::Browser {
     // Destroying the X11 window alone leaves the CEF browser and renderer alive.
     // Hide immediately, then let CEF close its browser and native window together.
     self.set_visible(0);
+    if let Some(xid) = self.xid() {
+      super::linux_stacking::unregister(xid as xlib::Window);
+    }
     if let Some(host) = self.host() {
       host.close_browser(1);
     }
@@ -196,5 +199,6 @@ impl CefBrowserExt for cef::Browser {
       (xlib.XFlush)(display);
       (xlib.XCloseDisplay)(display);
     }
+    super::linux_stacking::register(parent_xid as xlib::Window, xid as xlib::Window);
   }
 }
