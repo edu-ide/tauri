@@ -951,6 +951,7 @@ wrap_client! {
     custom_protocol_scheme: String,
     context: Context<T>,
     initial_url: Option<String>,
+    renderer_recovery: Arc<Mutex<request_handler::RendererRecoveryState>>,
   }
 
   impl Client {
@@ -958,6 +959,12 @@ wrap_client! {
       Some(request_handler::WebRequestHandler::new(
         self.initialization_scripts.clone(),
         self.navigation_handler.clone(),
+        request_handler::renderer_recovery_origin(
+          self.initial_url.as_deref(),
+          &self.custom_scheme_domain_names,
+          &self.custom_protocol_scheme,
+        ),
+        self.renderer_recovery.clone(),
       ))
     }
 
@@ -2978,6 +2985,7 @@ fn create_browser_window<T: UserEvent>(
     custom_protocol_scheme.to_string(),
     context.clone(),
     Some(initial_url),
+    Arc::new(Mutex::new(request_handler::RendererRecoveryState::default())),
   );
 
   let mut bounds = cef::Rect {
@@ -3332,6 +3340,7 @@ pub(crate) fn create_webview<T: UserEvent>(
     custom_protocol_scheme.to_string(),
     context.clone(),
     Some(initial_url.clone()),
+    Arc::new(Mutex::new(request_handler::RendererRecoveryState::default())),
   );
 
   let uri_scheme_protocols: HashMap<String, Arc<Box<UriSchemeProtocolHandler>>> =

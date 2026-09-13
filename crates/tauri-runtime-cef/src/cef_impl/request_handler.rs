@@ -4,8 +4,10 @@
 
 use std::{
   borrow::Cow,
+  collections::VecDeque,
   io::{Cursor, Read},
-  sync::Arc,
+  sync::{Arc, Mutex},
+  time::{Duration, Instant},
 };
 
 use cef::{rc::*, *};
@@ -117,13 +119,152 @@ wrap_resource_request_handler! {
   }
 }
 
+const RENDERER_RECOVERY_WINDOW: Duration = Duration::from_secs(60);
+const MAX_RENDERER_RECOVERIES: usize = 3;
+
+/// Owned by BrowserClient, since CEF can request a new RequestHandler after a crash.
+#[derive(Default)]
+pub struct RendererRecoveryState {
+  attempts: VecDeque<Instant>,
+}
+
+impl RendererRecoveryState {
+  fn reserve_attempt(&mut self, now: Instant) -> Option<usize> {
+    while let Some(attempt) = self.attempts.front() {
+      if now.saturating_duration_since(*attempt) < RENDERER_RECOVERY_WINDOW {
+        break;
+      }
+      self.attempts.pop_front();
+    }
+    if self.attempts.len() >= MAX_RENDERER_RECOVERIES {
+      return None;
+    }
+    self.attempts.push_back(now);
+    Some(self.attempts.len())
+  }
+}
+
+pub(super) fn renderer_recovery_origin(
+  initial_url: Option<&str>,
+  custom_scheme_domain_names: &[String],
+  custom_protocol_scheme: &str,
+) -> Option<Url> {
+  let url = Url::parse(initial_url?).ok()?;
+  if !matches!(custom_protocol_scheme, "http" | "https")
+    || url.scheme() != custom_protocol_scheme
+    || !url.username().is_empty()
+    || url.password().is_some()
+    || !custom_scheme_domain_names
+      .iter()
+      .any(|domain| Some(domain.as_str()) == url.host_str())
+  {
+    return None;
+  }
+  Some(url)
+}
+
+fn matches_recovery_origin(origin: &Url, current_url: &str) -> bool {
+  let Ok(current) = Url::parse(current_url) else {
+    return false;
+  };
+  current.username().is_empty()
+    && current.password().is_none()
+    && current.origin() == origin.origin()
+}
+
+wrap_task! {
+  struct RecoverInternalRendererTask {
+    browser: Browser,
+    origin: Url,
+  }
+
+  impl Task {
+    fn execute(&self) {
+      if self.browser.is_valid() == 0 {
+        return;
+      }
+      let Some(frame) = self.browser.main_frame() else {
+        return;
+      };
+      // A navigation or close may have happened while this UI task was queued.
+      let current_url = CefString::from(&frame.url()).to_string();
+      if !matches_recovery_origin(&self.origin, &current_url) {
+        return;
+      }
+      eprintln!(
+        "[tauri-cef] recovering internal renderer: browser_id={}",
+        self.browser.identifier()
+      );
+      self.browser.reload();
+    }
+  }
+}
+
 wrap_request_handler! {
   pub struct WebRequestHandler {
     initialization_scripts: Arc<Vec<CefInitScript>>,
     navigation_handler: Option<Arc<tauri_runtime::webview::NavigationHandler>>,
+    recovery_origin: Option<Url>,
+    renderer_recovery: Arc<Mutex<RendererRecoveryState>>,
   }
 
   impl RequestHandler {
+    fn on_render_process_terminated(
+      &self,
+      browser: Option<&mut Browser>,
+      status: TerminationStatus,
+      error_code: ::std::os::raw::c_int,
+      _error_string: Option<&CefString>,
+    ) {
+      let Some(browser) = browser else {
+        return;
+      };
+      let browser_id = browser.identifier();
+      eprintln!(
+        "[tauri-cef] renderer terminated: browser_id={browser_id} status={status:?} error_code={error_code}"
+      );
+      // Other Tauri applications may own unsaved documents. Recovery is opt-in
+      // for applications that can safely reconstruct their internal views.
+      if std::env::var("TAURI_CEF_RECOVER_APP_RENDERERS").as_deref() != Ok("1") {
+        return;
+      }
+      let Some(origin) = &self.recovery_origin else {
+        return;
+      };
+      if browser.is_valid() == 0 {
+        return;
+      }
+      let Some(frame) = browser.main_frame() else {
+        return;
+      };
+      let current_url = CefString::from(&frame.url()).to_string();
+      if !matches_recovery_origin(origin, &current_url) {
+        return;
+      }
+      let attempt = match self.renderer_recovery.lock() {
+        Ok(mut recovery) => recovery.reserve_attempt(Instant::now()),
+        Err(_) => {
+          eprintln!("[tauri-cef] renderer recovery state unavailable: browser_id={browser_id}");
+          return;
+        }
+      };
+      let Some(attempt) = attempt else {
+        eprintln!(
+          "[tauri-cef] renderer recovery suppressed: browser_id={browser_id} limit={MAX_RENDERER_RECOVERIES}/60s"
+        );
+        return;
+      };
+      eprintln!(
+        "[tauri-cef] renderer recovery queued: browser_id={browser_id} attempt={attempt}/{MAX_RENDERER_RECOVERIES}"
+      );
+      // Reloading within the termination callback can reenter CEF while it tears
+      // down the old renderer. Run it in a separate UI task instead.
+      let mut task = RecoverInternalRendererTask::new(browser.clone(), origin.clone());
+      if cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task)) == 0 {
+        eprintln!("[tauri-cef] renderer recovery task rejected: browser_id={browser_id}");
+      }
+    }
+
     fn on_before_browse(
       &self,
       _browser: Option<&mut Browser>,
@@ -432,4 +573,97 @@ fn get_request_headers(request: &mut Request) -> HeaderMap {
   }
 
   headers
+}
+
+#[cfg(test)]
+mod renderer_recovery_tests {
+  use super::*;
+
+  #[test]
+  fn recovery_requires_a_registered_initial_app_origin() {
+    let domains = vec!["tauri.localhost".to_string()];
+    let origin = renderer_recovery_origin(
+      Some("http://tauri.localhost/shell.html"),
+      &domains,
+      "http",
+    )
+    .unwrap();
+    assert_eq!(origin.host_str(), Some("tauri.localhost"));
+    for initial in [
+      None,
+      Some("not a url"),
+      Some("https://www.google.com/"),
+      Some("http://localhost/"),
+      Some("http://127.0.0.1/"),
+      Some("http://other.localhost/"),
+      Some("http://tauri.localhost.example.com/"),
+      Some("https://tauri.localhost/"),
+      Some("http://user@tauri.localhost/"),
+    ] {
+      assert!(
+        renderer_recovery_origin(initial, &domains, "http").is_none(),
+        "unexpected recovery origin for {initial:?}"
+      );
+    }
+    assert!(renderer_recovery_origin(Some(origin.as_str()), &[], "http").is_none());
+    assert!(renderer_recovery_origin(
+      Some("https://tauri.localhost/"),
+      &domains,
+      "https"
+    )
+    .is_some());
+  }
+
+  #[test]
+  fn recovery_rechecks_the_current_scheme_host_and_port() {
+    let origin = Url::parse("http://tauri.localhost/shell.html").unwrap();
+    assert!(matches_recovery_origin(
+      &origin,
+      "http://tauri.localhost:80/menu.html?panel=profile#details"
+    ));
+    for current in [
+      "",
+      "about:blank",
+      "https://www.google.com/",
+      "http://localhost/",
+      "https://tauri.localhost/",
+      "http://tauri.localhost:8080/",
+      "http://tauri.localhost.example.com/",
+      "http://user:password@tauri.localhost/",
+    ] {
+      assert!(
+        !matches_recovery_origin(&origin, current),
+        "must not reload navigation to {current}"
+      );
+    }
+  }
+
+  #[test]
+  fn recovery_budget_expires_attempts_individually_after_sixty_seconds() {
+    let mut state = RendererRecoveryState::default();
+    let now = Instant::now();
+    assert_eq!(state.reserve_attempt(now), Some(1));
+    assert_eq!(state.reserve_attempt(now + Duration::from_secs(10)), Some(2));
+    assert_eq!(state.reserve_attempt(now + Duration::from_secs(20)), Some(3));
+    assert_eq!(state.reserve_attempt(now + Duration::from_secs(59)), None);
+    assert_eq!(state.reserve_attempt(now + Duration::from_secs(60)), Some(3));
+    assert_eq!(state.reserve_attempt(now + Duration::from_secs(69)), None);
+    assert_eq!(state.reserve_attempt(now + Duration::from_secs(70)), Some(3));
+    assert_eq!(state.reserve_attempt(now + Duration::from_secs(131)), Some(1));
+  }
+
+  #[test]
+  fn recovery_budget_is_shared_by_handlers_but_independent_between_browsers() {
+    let client_state = Arc::new(Mutex::new(RendererRecoveryState::default()));
+    let now = Instant::now();
+    for attempt in 1..=MAX_RENDERER_RECOVERIES {
+      let handler_state = client_state.clone();
+      assert_eq!(
+        handler_state.lock().unwrap().reserve_attempt(now),
+        Some(attempt)
+      );
+    }
+    assert_eq!(client_state.lock().unwrap().reserve_attempt(now), None);
+    assert_eq!(RendererRecoveryState::default().reserve_attempt(now), Some(1));
+  }
 }
