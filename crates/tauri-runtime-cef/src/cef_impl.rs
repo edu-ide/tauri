@@ -956,6 +956,32 @@ wrap_life_span_handler! {
   }
 }
 
+#[cfg(target_os = "linux")]
+wrap_focus_handler! {
+  struct BrowserFocusHandler<T: UserEvent> {
+    window_id: WindowId,
+    context: Context<T>,
+  }
+
+  impl FocusHandler {
+    fn on_set_focus(&self, browser: Option<&mut Browser>, _source: FocusSource) -> std::os::raw::c_int {
+      // Views-hosted browsers already share their owner's focus manager.
+      // Only separately embedded native children use CefWindowX11's timer.
+      if browser.as_deref().and_then(|browser| browser.host()).is_some_and(|host| host.has_view() == 1) {
+        return 0;
+      }
+      // CefWindowX11 restores child focus after 100ms. Its child may miss a
+      // FocusOut when the desktop activates another top-level window, leaving
+      // that delayed callback able to steal native focus back. Browser focus
+      // must remain inside the currently active owning window.
+      let window = self.context.windows.try_borrow().ok().and_then(|windows| {
+        windows.get(&self.window_id).and_then(|owner| owner.window())
+      });
+      window.map(|window| i32::from(window.is_active() == 0)).unwrap_or(0)
+    }
+  }
+}
+
 wrap_client! {
   struct BrowserClient<T: UserEvent> {
     window_kind: WindowKind,
@@ -976,6 +1002,14 @@ wrap_client! {
   }
 
   impl Client {
+    fn focus_handler(&self) -> Option<FocusHandler> {
+      #[cfg(target_os = "linux")]
+      if matches!(self.window_kind, WindowKind::Tauri) {
+        return Some(BrowserFocusHandler::new(self.window_id, self.context.clone()));
+      }
+      None
+    }
+
     fn request_handler(&self) -> Option<RequestHandler> {
       Some(request_handler::WebRequestHandler::new(
         self.initialization_scripts.clone(),
@@ -2248,24 +2282,9 @@ fn linux_present_x11_window(window: &cef::Window, decorations: bool) {
     let mut xids = Vec::new();
     if handle > 1 {
       let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
-      let mut root = 0 as xlib::Window;
-      let mut parent = 0 as xlib::Window;
-      let mut children: *mut xlib::Window = std::ptr::null_mut();
-      let mut n = 0 as std::os::raw::c_uint;
-      let parent_is_root = (xlib.XQueryTree)(
-        display,
-        handle,
-        &mut root,
-        &mut parent,
-        &mut children,
-        &mut n,
-      ) != 0
-        && parent == root;
-      if !children.is_null() {
-        (xlib.XFree)(children as *mut _);
-      }
-      if parent_is_root
-        && (xlib.XGetWindowAttributes)(display, handle, &mut attrs) != 0
+      // CEF returns this Views window's native client XID. A window manager
+      // may reparent it into a frame, so its parent need not be the X root.
+      if (xlib.XGetWindowAttributes)(display, handle, &mut attrs) != 0
         && attrs.class == xlib::InputOutput
       {
         xids.push(handle);
@@ -2800,7 +2819,9 @@ fn handle_window_message<T: UserEvent>(
         .borrow()
         .get(&window_id)
         .map(|w| match &w.window {
-          crate::AppWindowKind::Window(window) => Ok(window.has_focus() == 1),
+          // Match on_window_activation_changed: a focused child view does not
+          // tell whether the native window currently owns desktop activation.
+          crate::AppWindowKind::Window(window) => Ok(window.is_active() == 1),
           crate::AppWindowKind::BrowserWindow => Err(tauri_runtime::Error::FailedToSendMessage),
         })
         .unwrap_or_else(|| Err(tauri_runtime::Error::FailedToSendMessage));
@@ -3224,6 +3245,8 @@ fn handle_window_message<T: UserEvent>(
     WindowMessage::SetFocus => {
       if let Some(app_window) = context.windows.borrow().get(&window_id) {
         if let Some(window) = app_window.window() {
+          // View focus alone cannot activate a different native window.
+          window.activate();
           window.request_focus();
         }
       }
