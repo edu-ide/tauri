@@ -4,7 +4,24 @@ use x11_dl::xlib;
 
 use crate::cef_webview::CefBrowserExt;
 
-pub(super) static X11: LazyLock<Option<xlib::Xlib>> = LazyLock::new(|| xlib::Xlib::open().ok());
+unsafe extern "C" fn linux_x11_ignore_error(
+  _: *mut xlib::Display,
+  _: *mut xlib::XErrorEvent,
+) -> std::os::raw::c_int {
+  0
+}
+
+pub(super) static X11: LazyLock<Option<xlib::Xlib>> = LazyLock::new(|| {
+  let opened = xlib::Xlib::open().ok();
+  if let Some(ref xl) = opened {
+    // linux.rs opens its own Display. The default Xlib handler aborts on
+    // BadWindow during child-tab ConfigureWindow; keep the process alive.
+    unsafe {
+      (xl.XSetErrorHandler)(Some(linux_x11_ignore_error));
+    }
+  }
+  opened
+});
 
 impl CefBrowserExt for cef::Browser {
   fn xid(&self) -> Option<u64> {
@@ -91,8 +108,9 @@ impl CefBrowserExt for cef::Browser {
         rect.width as u32,
         rect.height as u32,
       );
-      // Ensure window is mapped and raised after setting bounds
-      (xlib.XMapRaised)(display, xid as xlib::Window);
+      // Do not XMapRaised here. Raising on every layout puts the shell or a
+      // tab above chrome, and fights ANGLE's full-window surface so clicks
+      // land on an ExposureMask-only child and do nothing.
       (xlib.XFlush)(display);
       (xlib.XCloseDisplay)(display);
     }
@@ -154,7 +172,7 @@ impl CefBrowserExt for cef::Browser {
     };
 
     let parent_xid = parent.window_handle() as u64;
-    if parent_xid == 0 {
+    if parent_xid <= 1 {
       return;
     }
 
@@ -194,8 +212,9 @@ impl CefBrowserExt for cef::Browser {
         0,
       );
 
-      // Ensure window is mapped and raised after reparenting
-      (xlib.XMapRaised)(display, xid as xlib::Window);
+      // Map without raising. XMapRaised put a full-size shell above the tab
+      // so the content hole stayed white (2026-09-16).
+      (xlib.XMapWindow)(display, xid as xlib::Window);
       (xlib.XFlush)(display);
       (xlib.XCloseDisplay)(display);
     }

@@ -205,7 +205,10 @@ fn apply_content_protection(window: &cef::Window, protected: bool) {
 fn apply_window_decorations(window: &cef::Window, decorations: bool) {
   #[cfg(target_os = "linux")]
   {
-    let _ = (window, decorations);
+    let handle = window.window_handle() as x11_dl::xlib::Window;
+    if handle > 1 {
+      linux_apply_motif_decorations(handle, decorations);
+    }
   }
 
   #[cfg(windows)]
@@ -2134,8 +2137,426 @@ fn start_window_dragging(window: &cef::Window) {
   target_os = "netbsd",
   target_os = "openbsd"
 ))]
-fn start_window_dragging(window: &cef::Window) {
+/// GNOME 46 Wayland shows X11 windows only after they leave Iconic. Decorated
+/// windows also need `mutter-x11-frames`; if that helper is dead they stay
+/// unmapped with `_MUTTER_NEEDS_FRAME=1`. ChatGPT on this session maps because
+/// `_MOTIF_WM_HINTS` decorations=0 (no frames helper) and `_NET_STARTUP_ID` is
+/// set. Do the same: CSD, NormalState, map the real toplevel (by PID, not only
+/// `GetWindowHandle`, which can be the 10x10 client leader), never Withdraw.
+unsafe extern "C" fn linux_x11_ignore_error(
+  _: *mut x11_dl::xlib::Display,
+  _: *mut x11_dl::xlib::XErrorEvent,
+) -> std::os::raw::c_int {
+  0
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+fn linux_apply_motif_decorations(win: x11_dl::xlib::Window, decorations: bool) {
+  use x11_dl::xlib;
+  if win <= 1 {
+    return;
+  }
+  let Some(xl) = xlib::Xlib::open().ok() else {
+    return;
+  };
+  unsafe {
+    let display = (xl.XOpenDisplay)(std::ptr::null());
+    if display.is_null() {
+      return;
+    }
+    let prev_handler = (xl.XSetErrorHandler)(Some(linux_x11_ignore_error));
+    linux_set_motif_decorations(&xl, display, win, decorations);
+    (xl.XFlush)(display);
+    if prev_handler.is_some() {
+      (xl.XSetErrorHandler)(prev_handler);
+    }
+    (xl.XCloseDisplay)(display);
+  }
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+unsafe fn linux_set_motif_decorations(
+  xl: &x11_dl::xlib::Xlib,
+  display: *mut x11_dl::xlib::Display,
+  win: x11_dl::xlib::Window,
+  decorations: bool,
+) {
+  use std::os::raw::{c_uchar, c_ulong};
+  use x11_dl::xlib;
+  const MWM_HINTS_DECORATIONS: c_ulong = 1 << 1;
+  const MWM_DECOR_ALL: c_ulong = 1;
+  let atom = (xl.XInternAtom)(display, c"_MOTIF_WM_HINTS".as_ptr(), 0);
+  if atom == 0 {
+    return;
+  }
+  let hints: [c_ulong; 5] = [
+    MWM_HINTS_DECORATIONS,
+    0,
+    if decorations { MWM_DECOR_ALL } else { 0 },
+    0,
+    0,
+  ];
+  (xl.XChangeProperty)(
+    display,
+    win,
+    atom,
+    atom,
+    32,
+    xlib::PropModeReplace,
+    hints.as_ptr() as *const c_uchar,
+    5,
+  );
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+fn linux_present_x11_window(window: &cef::Window, decorations: bool) {
   use std::ffi::CString;
+  use x11_dl::xlib;
+
+  let Some(xlib) = xlib::Xlib::open().ok() else {
+    return;
+  };
+  unsafe {
+    let display = (xlib.XOpenDisplay)(std::ptr::null());
+    if display.is_null() {
+      return;
+    }
+    // A second Display has the default Xlib handler, which exits on BadWindow.
+    // CEF GetWindowHandle is 0x1 (PointerRoot) until the Views window exists.
+    let prev_handler = (xlib.XSetErrorHandler)(Some(linux_x11_ignore_error));
+    let handle = window.window_handle() as xlib::Window;
+    // Only the Views toplevel. Mapping every PID window raised ANGLE/tab
+    // children over chrome so clicks hit an input-dead surface.
+    let mut xids = Vec::new();
+    if handle > 1 {
+      let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
+      let mut root = 0 as xlib::Window;
+      let mut parent = 0 as xlib::Window;
+      let mut children: *mut xlib::Window = std::ptr::null_mut();
+      let mut n = 0 as std::os::raw::c_uint;
+      let parent_is_root = (xlib.XQueryTree)(
+        display,
+        handle,
+        &mut root,
+        &mut parent,
+        &mut children,
+        &mut n,
+      ) != 0
+        && parent == root;
+      if !children.is_null() {
+        (xlib.XFree)(children as *mut _);
+      }
+      if parent_is_root
+        && (xlib.XGetWindowAttributes)(display, handle, &mut attrs) != 0
+        && attrs.class == xlib::InputOutput
+      {
+        xids.push(handle);
+      }
+    }
+    if xids.is_empty() {
+      xids = linux_x11_windows_for_pid(&xlib, display, std::process::id());
+    }
+    let class_owned = std::env::current_exe()
+      .ok()
+      .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+      .unwrap_or_else(|| "app".into());
+    let class = CString::new(class_owned).unwrap_or_else(|_| CString::new("app").unwrap());
+    let startup = std::env::var("DESKTOP_STARTUP_ID")
+      .ok()
+      .filter(|s| !s.is_empty())
+      .and_then(|s| CString::new(s).ok());
+    let startup_time = startup
+      .as_ref()
+      .and_then(|s| s.to_str().ok())
+      .and_then(|s| s.rsplit_once("_TIME"))
+      .and_then(|(_, t)| t.parse::<std::os::raw::c_long>().ok())
+      .unwrap_or(0);
+
+    for win in &xids {
+      linux_present_one_x11_window(
+        &xlib,
+        display,
+        *win,
+        &class,
+        startup.as_ref(),
+        startup_time,
+        decorations,
+      );
+    }
+    (xlib.XSync)(display, 0);
+
+    let any_viewable = xids.iter().any(|win| linux_x11_is_viewable(&xlib, display, *win));
+    if !any_viewable && decorations {
+      // Session mutter-x11-frames (GNOME) wraps decorated X11 windows.
+      // Never spawn it as our child: /proc/<pid>/comm truncates to 15 bytes
+      // ("mutter-x11-frame"), so a full-name check always spawned a second
+      // helper that inherited Chromium's CDP listen fd (2026-09-16).
+      (xlib.XSync)(display, 0);
+      for win in &xids {
+        linux_present_one_x11_window(
+          &xlib,
+          display,
+          *win,
+          &class,
+          startup.as_ref(),
+          startup_time,
+          decorations,
+        );
+      }
+      (xlib.XFlush)(display);
+    }
+    (xlib.XSync)(display, 0);
+    // Never restore the default abort handler. Chromium may not have installed
+    // its own yet; putting the default back makes a later X_ConfigureWindow
+    // BadWindow (child tab layout) kill the process.
+    if prev_handler.is_some() {
+      (xlib.XSetErrorHandler)(prev_handler);
+    }
+    (xlib.XCloseDisplay)(display);
+  }
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+unsafe fn linux_x11_window_pid(
+  xlib: &x11_dl::xlib::Xlib,
+  display: *mut x11_dl::xlib::Display,
+  net_pid: x11_dl::xlib::Atom,
+  win: x11_dl::xlib::Window,
+) -> Option<u32> {
+  use std::os::raw::{c_int, c_uchar, c_ulong};
+  let mut actual_type: x11_dl::xlib::Atom = 0;
+  let mut actual_format: c_int = 0;
+  let mut nitems: c_ulong = 0;
+  let mut bytes_after: c_ulong = 0;
+  let mut prop: *mut c_uchar = std::ptr::null_mut();
+  let status = (xlib.XGetWindowProperty)(
+    display,
+    win,
+    net_pid,
+    0,
+    1,
+    0,
+    x11_dl::xlib::XA_CARDINAL,
+    &mut actual_type,
+    &mut actual_format,
+    &mut nitems,
+    &mut bytes_after,
+    &mut prop,
+  );
+  if status != 0 || prop.is_null() || nitems == 0 {
+    if !prop.is_null() {
+      (xlib.XFree)(prop as *mut _);
+    }
+    return None;
+  }
+  let pid = *(prop as *const u32);
+  (xlib.XFree)(prop as *mut _);
+  Some(pid)
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+unsafe fn linux_x11_windows_for_pid(
+  xlib: &x11_dl::xlib::Xlib,
+  display: *mut x11_dl::xlib::Display,
+  pid: u32,
+) -> Vec<x11_dl::xlib::Window> {
+  use std::os::raw::c_uint;
+  let mut out = Vec::new();
+  let root = (xlib.XDefaultRootWindow)(display);
+  let net_pid = (xlib.XInternAtom)(display, c"_NET_WM_PID".as_ptr(), 0);
+  let mut root_ret = 0 as x11_dl::xlib::Window;
+  let mut parent_ret = 0 as x11_dl::xlib::Window;
+  let mut children: *mut x11_dl::xlib::Window = std::ptr::null_mut();
+  let mut n: c_uint = 0;
+  if (xlib.XQueryTree)(display, root, &mut root_ret, &mut parent_ret, &mut children, &mut n) == 0 {
+    return out;
+  }
+  if !children.is_null() {
+    let slice = std::slice::from_raw_parts(children, n as usize);
+    for &win in slice {
+      if linux_x11_window_pid(xlib, display, net_pid, win) != Some(pid) {
+        continue;
+      }
+      let mut attrs: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
+      if (xlib.XGetWindowAttributes)(display, win, &mut attrs) == 0 {
+        continue;
+      }
+      if attrs.class == x11_dl::xlib::InputOutput
+        && attrs.override_redirect == 0
+        && attrs.width >= 64
+        && attrs.height >= 64
+      {
+        out.push(win);
+      }
+    }
+    (xlib.XFree)(children as *mut _);
+  }
+  out
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+unsafe fn linux_x11_is_viewable(
+  xlib: &x11_dl::xlib::Xlib,
+  display: *mut x11_dl::xlib::Display,
+  win: x11_dl::xlib::Window,
+) -> bool {
+  let mut attrs: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
+  (xlib.XGetWindowAttributes)(display, win, &mut attrs) != 0
+    && attrs.map_state == x11_dl::xlib::IsViewable
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+unsafe fn linux_present_one_x11_window(
+  xl: &x11_dl::xlib::Xlib,
+  display: *mut x11_dl::xlib::Display,
+  win: x11_dl::xlib::Window,
+  class: &std::ffi::CString,
+  startup: Option<&std::ffi::CString>,
+  startup_time: std::os::raw::c_long,
+  decorations: bool,
+) {
+  use std::os::raw::c_long;
+  use x11_dl::xlib;
+  if win <= 1 {
+    return;
+  }
+  let root = (xl.XDefaultRootWindow)(display);
+  let mut hint = xlib::XClassHint {
+    res_name: class.as_ptr() as *mut _,
+    res_class: class.as_ptr() as *mut _,
+  };
+  (xl.XSetClassHint)(display, win, &mut hint);
+  linux_set_motif_decorations(xl, display, win, decorations);
+
+  let mut wm_hints: xlib::XWMHints = std::mem::zeroed();
+  wm_hints.flags = xlib::InputHint | xlib::StateHint;
+  wm_hints.input = 1;
+  wm_hints.initial_state = 1; // ICCCM NormalState
+  (xl.XSetWMHints)(display, win, &mut wm_hints);
+
+  if let Some(id) = startup {
+    let atom = (xl.XInternAtom)(display, c"_NET_STARTUP_ID".as_ptr(), 0);
+    let bytes = id.as_bytes();
+    (xl.XChangeProperty)(
+      display,
+      win,
+      atom,
+      xlib::XA_STRING,
+      8,
+      xlib::PropModeReplace,
+      bytes.as_ptr(),
+      bytes.len() as i32,
+    );
+  }
+
+  let mask = (xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask) as c_long;
+  let wm_change = (xl.XInternAtom)(display, c"WM_CHANGE_STATE".as_ptr(), 0);
+  let mut ev: xlib::XClientMessageEvent = std::mem::zeroed();
+  ev.type_ = xlib::ClientMessage;
+  ev.window = win;
+  ev.message_type = wm_change;
+  ev.format = 32;
+  ev.data.set_long(0, 1); // NormalState
+  (xl.XSendEvent)(display, root, 0, mask, &mut ev as *mut _ as *mut xlib::XEvent);
+
+  let net_active = (xl.XInternAtom)(display, c"_NET_ACTIVE_WINDOW".as_ptr(), 0);
+  let mut ev2: xlib::XClientMessageEvent = std::mem::zeroed();
+  ev2.type_ = xlib::ClientMessage;
+  ev2.window = win;
+  ev2.message_type = net_active;
+  ev2.format = 32;
+  ev2.data.set_long(0, 1);
+  ev2.data.set_long(1, startup_time);
+  (xl.XSendEvent)(display, root, 0, mask, &mut ev2 as *mut _ as *mut xlib::XEvent);
+
+  (xl.XMapRaised)(display, win);
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+unsafe fn linux_x11_drag_toplevel(
+  xlib: &x11_dl::xlib::Xlib,
+  display: *mut x11_dl::xlib::Display,
+  handle: x11_dl::xlib::Window,
+) -> x11_dl::xlib::Window {
+  let mut best = handle;
+  let mut best_area = 0i64;
+  for win in linux_x11_windows_for_pid(xlib, display, std::process::id()) {
+    if !linux_x11_is_viewable(xlib, display, win) {
+      continue;
+    }
+    let mut attrs: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
+    if (xlib.XGetWindowAttributes)(display, win, &mut attrs) == 0 {
+      continue;
+    }
+    let area = attrs.width as i64 * attrs.height as i64;
+    if area > best_area {
+      best = win;
+      best_area = area;
+    }
+  }
+  if best > 1 {
+    best
+  } else {
+    handle
+  }
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+fn start_window_dragging(window: &cef::Window) {
   use std::os::raw::c_long;
   use x11_dl::xlib;
 
@@ -2149,7 +2570,12 @@ fn start_window_dragging(window: &cef::Window) {
       return;
     }
 
-    let win = window.window_handle() as u64;
+    let handle = window.window_handle() as xlib::Window;
+    let win = linux_x11_drag_toplevel(&xlib, display, handle);
+    if win <= 1 {
+      (xlib.XCloseDisplay)(display);
+      return;
+    }
 
     let mut root_x: std::ffi::c_int = 0;
     let mut root_y: std::ffi::c_int = 0;
@@ -2170,8 +2596,7 @@ fn start_window_dragging(window: &cef::Window) {
       &mut _mask,
     );
 
-    let net_wm_moveresize = CString::new("_NET_WM_MOVERESIZE").unwrap();
-    let atom = (xlib.XInternAtom)(display, net_wm_moveresize.as_ptr(), xlib::False);
+    let atom = (xlib.XInternAtom)(display, c"_NET_WM_MOVERESIZE".as_ptr(), xlib::False);
     if atom == 0 {
       (xlib.XCloseDisplay)(display);
       return;
@@ -2203,7 +2628,9 @@ fn start_window_dragging(window: &cef::Window) {
     };
 
     let mut event: xlib::XEvent = xclient.into();
-    let _ = (xlib.XSendEvent)(display, root, xlib::False, 0, &mut event);
+    let mask = (xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask) as c_long;
+    (xlib.XUngrabPointer)(display, xlib::CurrentTime);
+    let _ = (xlib.XSendEvent)(display, root, xlib::False, mask, &mut event);
     (xlib.XFlush)(display);
     (xlib.XCloseDisplay)(display);
   }
@@ -2646,6 +3073,17 @@ fn handle_window_message<T: UserEvent>(
       if let Some(app_window) = context.windows.borrow().get(&window_id) {
         if let Some(window) = app_window.window() {
           window.restore();
+          #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+          ))]
+          linux_present_x11_window(
+            &window,
+            app_window.attributes.borrow().decorations.unwrap_or(true),
+          );
         }
       }
     }
@@ -2653,6 +3091,17 @@ fn handle_window_message<T: UserEvent>(
       if let Some(app_window) = context.windows.borrow().get(&window_id) {
         if let Some(window) = app_window.window() {
           window.show();
+          #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+          ))]
+          linux_present_x11_window(
+            &window,
+            app_window.attributes.borrow().decorations.unwrap_or(true),
+          );
         }
       }
     }
