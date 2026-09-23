@@ -2098,9 +2098,14 @@ impl<T: UserEvent> CefRuntime<T> {
       command_line_args.push(("--password-store".to_string(), Some("basic".to_string())));
     }
 
-    // Agent/MCP 자동화를 위한 CDP(Chrome DevTools Protocol) 개방
-    command_line_args.push(("--remote-debugging-port".to_string(), Some("19222".to_string())));
-    command_line_args.push(("--remote-debugging-address".to_string(), Some("127.0.0.1".to_string())));
+    // Keep each desktop product on its own loopback CDP endpoint. The product
+    // launcher supplies a default; an explicit value can override or disable it.
+    let cdp_port = std::env::var("TAURI_CEF_REMOTE_DEBUGGING_PORT")
+      .unwrap_or_else(|_| "19305".to_string());
+    if cdp_port != "0" {
+      set_switch_value_if_absent(&mut command_line_args, "remote-debugging-port", &cdp_port);
+      set_switch_value_if_absent(&mut command_line_args, "remote-debugging-address", "127.0.0.1");
+    }
 
     let mut app = cef_impl::TauriApp::new(
       cef_context.clone(),
