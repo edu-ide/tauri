@@ -362,10 +362,25 @@ unsafe fn repair_parent(
     return Vec::new();
   }
   let repaired = surface_repairs(&snapshot);
-  // XLower/XRaise every 16ms even when order is already correct flashes the
-  // compositor and steals the pointer grab, so the window cannot be dragged
-  // (2026-09-16).
-  if !stacking_ok(&snapshot) {
+  // Move only the new ANGLE surface below the first managed view. Lowering
+  // and then raising every sibling also changes the order of unrelated X11
+  // children and can cover native menus with a previously hidden view.
+  if !repaired.is_empty() {
+    for (surface, anchor) in &repaired {
+      let mut changes: xlib::XWindowChanges = std::mem::zeroed();
+      changes.sibling = *anchor;
+      changes.stack_mode = xlib::Below;
+      (xlib.XConfigureWindow)(
+        display,
+        *surface,
+        (xlib::CWSibling | xlib::CWStackMode) as u32,
+        &mut changes,
+      );
+      eprintln!("[tauri-cef] native host surface restacked: parent={parent} surface={surface} anchor={anchor}");
+    }
+  } else if !stacking_ok(&snapshot) {
+    // XLower/XRaise every 16ms even when order is already correct flashes
+    // the compositor and steals the pointer grab (2026-09-16).
     let (lower, raise_shell, raise_tabs) = stacking_actions(&snapshot);
     for id in lower {
       (xlib.XLowerWindow)(display, id);
