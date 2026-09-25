@@ -57,8 +57,6 @@ struct ChildStackingGuard {
   display: *mut xlib::Display,
   parents: HashMap<xlib::Window, HashSet<xlib::Window>>,
   last_event_check: Instant,
-  /// The page window already given focus for the button press still held (one focus change per press).
-  pressed_page: Option<xlib::Window>,
 }
 
 impl ChildStackingGuard {
@@ -69,7 +67,6 @@ impl ChildStackingGuard {
       display,
       parents: HashMap::new(),
       last_event_check: Instant::now(),
-      pressed_page: None,
     })
   }
 
@@ -136,92 +133,8 @@ impl ChildStackingGuard {
       for (parent, children) in parents {
         let _ = repair_parent(xlib, self.display, parent, &children);
       }
-      self.focus_clicked_page(xlib);
     }
   }
-
-  /// GNOME gives X keyboard focus to the app's toplevel when the person comes back from another app, and a
-  /// click in a page does not move it into the page's own window: Chromium then counts the page as active
-  /// only while the pointer is inside it and closed the page's autocomplete list as soon as the pointer moved
-  /// onto the list (2026-09-25, 홈택스 아이디 칸; reproduced on Xvfb by focusing the toplevel). While a button
-  /// is pressed inside an embedded page and keyboard focus is elsewhere in the same app window, put the focus
-  /// in the page's window — what CefWindowX11::Focus does when CEF itself focuses the page.
-  unsafe fn focus_clicked_page(&mut self, xlib: &xlib::Xlib) {
-    let root = (xlib.XDefaultRootWindow)(self.display);
-    let (mut root_ret, mut child, mut root_x, mut root_y, mut x, mut y, mut mask) = (0, 0, 0, 0, 0, 0, 0u32);
-    if (xlib.XQueryPointer)(self.display, root, &mut root_ret, &mut child, &mut root_x, &mut root_y, &mut x, &mut y, &mut mask) == 0
-      || mask & (xlib::Button1Mask | xlib::Button2Mask | xlib::Button3Mask) == 0
-    {
-      self.pressed_page = None;
-      return;
-    }
-    // The deepest window under the pointer.
-    let mut under = child;
-    while under > 1 {
-      let mut next = 0;
-      if (xlib.XQueryPointer)(self.display, under, &mut root_ret, &mut next, &mut root_x, &mut root_y, &mut x, &mut y, &mut mask) == 0 || next == 0 {
-        break;
-      }
-      under = next;
-    }
-    let Some((parent, page)) = self.parents.iter().find_map(|(parent, children)| {
-      children.iter().find(|page| is_within(xlib, self.display, under, **page)).map(|page| (*parent, *page))
-    }) else {
-      return;
-    };
-    if self.pressed_page == Some(page) {
-      return;
-    }
-    let (mut focus, mut revert) = (0, 0);
-    (xlib.XGetInputFocus)(self.display, &mut focus, &mut revert);
-    // Only inside the app's own window: a press that is activating the app waits until the desktop has
-    // given it focus (checked again on the next frame while the button is held).
-    if is_within(xlib, self.display, focus, page) || !is_within(xlib, self.display, focus, toplevel_of(xlib, self.display, parent)) {
-      return;
-    }
-    let target = first_viewable_child(xlib, self.display, page).unwrap_or(page);
-    (xlib.XSetInputFocus)(self.display, target, xlib::RevertToParent, xlib::CurrentTime);
-    (xlib.XFlush)(self.display);
-    self.pressed_page = Some(page);
-  }
-}
-
-/// Whether `window` is `ancestor` or lies inside it. PointerRoot (1) and None (0) are never inside.
-unsafe fn is_within(xlib: &xlib::Xlib, display: *mut xlib::Display, mut window: xlib::Window, ancestor: xlib::Window) -> bool {
-  for _ in 0..64 {
-    if window <= 1 || ancestor <= 1 {
-      return false;
-    }
-    if window == ancestor {
-      return true;
-    }
-    match children_of(xlib, display, window) {
-      Some((parent, _)) if parent > 1 => window = parent,
-      _ => return false,
-    }
-  }
-  false
-}
-
-/// The window directly below the root that contains `window` (the app's toplevel, or the frame around it).
-unsafe fn toplevel_of(xlib: &xlib::Xlib, display: *mut xlib::Display, mut window: xlib::Window) -> xlib::Window {
-  let root = (xlib.XDefaultRootWindow)(display);
-  for _ in 0..64 {
-    match children_of(xlib, display, window) {
-      Some((parent, _)) if parent > 1 && parent != root => window = parent,
-      _ => break,
-    }
-  }
-  window
-}
-
-/// Chromium's own window is the topmost viewable child of the CEF window.
-unsafe fn first_viewable_child(xlib: &xlib::Xlib, display: *mut xlib::Display, window: xlib::Window) -> Option<xlib::Window> {
-  let (_, children) = children_of(xlib, display, window)?;
-  children.into_iter().rev().find(|child| {
-    let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
-    (xlib.XGetWindowAttributes)(display, *child, &mut attrs) != 0 && attrs.map_state == xlib::IsViewable
-  })
 }
 
 impl Drop for ChildStackingGuard {
