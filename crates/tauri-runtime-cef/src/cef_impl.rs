@@ -40,6 +40,20 @@ use cookie::{CollectAllCookiesVisitor, CollectUrlCookiesVisitor};
 
 #[cfg(target_os = "linux")]
 type CefOsEvent<'a> = Option<&'a mut sys::XEvent>;
+#[cfg(target_os = "linux")]
+fn linux_window_property_string(value: &str) -> CefString {
+  // The generated CefString conversion drops newly allocated strings when
+  // LinuxWindowProperties is copied back to CEF. Transfer the raw CEF string
+  // instead; CefLinuxWindowProperties owns and clears it after widget setup.
+  let mut raw = unsafe { std::mem::zeroed() };
+  let converted = unsafe {
+    sys::cef_string_utf8_to_utf16(value.as_ptr().cast(), value.len(), &mut raw)
+  };
+  if converted == 0 {
+    return CefString::default();
+  }
+  CefString::from(raw)
+}
 #[cfg(target_os = "macos")]
 type CefOsEvent<'a> = *mut u8;
 #[cfg(windows)]
@@ -349,6 +363,7 @@ fn hash_script(script: &str) -> String {
 
 #[derive(Clone)]
 pub struct Context<T: UserEvent> {
+  pub application_id: String,
   pub windows: Arc<RefCell<HashMap<WindowId, AppWindow>>>,
   pub callback: Arc<RefCell<Box<dyn Fn(RunEvent<T>)>>>,
   pub next_window_id: Arc<AtomicU32>,
@@ -1192,6 +1207,23 @@ wrap_window_delegate! {
   impl PanelDelegate {}
 
   impl WindowDelegate {
+    fn linux_window_properties(
+      &self,
+      _window: Option<&mut Window>,
+      properties: Option<&mut LinuxWindowProperties>,
+    ) -> i32 {
+      let Some(properties) = properties else {
+        return 0;
+      };
+      // CEF Views does not inherit GTK's application ID. Supply the desktop
+      // entry ID explicitly so Wayland and X11 can resolve the app's icon.
+      let app_id = self.context.application_id.as_str();
+      properties.wayland_app_id = linux_window_property_string(app_id);
+      properties.wm_class_class = linux_window_property_string(app_id);
+      properties.wm_class_name = linux_window_property_string(app_id);
+      1
+    }
+
     fn on_window_created(&self, window: Option<&mut Window>) {
       if let Some(window) = window {
 

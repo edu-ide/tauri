@@ -1926,6 +1926,7 @@ impl<T: UserEvent> CefRuntime<T> {
 
     let event_tx_ = event_tx.clone();
     let cef_context = cef_impl::Context {
+      application_id: runtime_args.identifier.clone(),
       windows: Default::default(),
       callback: Arc::new(RefCell::new(Box::new(move |event| {
         event_tx_.send(event).unwrap();
