@@ -5,6 +5,10 @@
 //! parented Browser windows even while their renderers and CDP remain healthy.
 //! Observe only parents supplied by CefWindow/BrowserHost; never enumerate or
 //! restack other desktop windows, infer tabs from URLs, or map hidden children.
+//!
+//! The same guard hands keyboard focus from such a parent to one of its
+//! browsers when the window manager puts focus on the parent itself (see
+//! `follow_focus`).
 
 use std::{
   cell::RefCell,
@@ -57,7 +61,18 @@ struct ChildStackingGuard {
   display: *mut xlib::Display,
   parents: HashMap<xlib::Window, HashSet<xlib::Window>>,
   last_event_check: Instant,
+  /// X keyboard focus as last seen, so focus is examined when it moves.
+  last_focus: xlib::Window,
+  /// Per parent, the browser whose window held X focus most recently.
+  focused_child: HashMap<xlib::Window, xlib::Window>,
+  /// While focus sits on a parent with no browser to hand it to yet, look again at this time.
+  recheck_at: Option<Instant>,
+  last_handoff: Option<Instant>,
 }
+
+/// Something that keeps pulling focus back to the parent gets one handoff per this long, not a fight every frame.
+const HANDOFF_COOLDOWN: Duration = Duration::from_millis(500);
+const RECHECK_EVERY: Duration = Duration::from_millis(100);
 
 impl ChildStackingGuard {
   fn new() -> Option<Self> {
@@ -67,6 +82,10 @@ impl ChildStackingGuard {
       display,
       parents: HashMap::new(),
       last_event_check: Instant::now(),
+      last_focus: 0,
+      focused_child: HashMap::new(),
+      recheck_at: None,
+      last_handoff: None,
     })
   }
 
@@ -133,8 +152,175 @@ impl ChildStackingGuard {
       for (parent, children) in parents {
         let _ = repair_parent(xlib, self.display, parent, &children);
       }
+      self.follow_focus(xlib);
     }
   }
+
+  /// GNOME gives X focus to the app's own toplevel when the person comes back
+  /// through the title bar, the dock or Alt+Tab, and whenever the app presents
+  /// its window (start-up, shell reload, a second launch). CEF moves focus into
+  /// a browser only when the pointer is over one at that moment, so it often
+  /// stayed on the toplevel. Chromium then counts the tab as active only while
+  /// the pointer is inside it: its autocomplete list, a separate X window,
+  /// closed as the pointer moved onto it, or did not open at all (2026-09-26,
+  /// 홈택스·크레딧포유 아이디 칸; reproduced in a nested GNOME with IBus). When
+  /// focus lands on a parent, hand it once to the browser the person means: the
+  /// one under the pointer, else the one that had focus last, else the shell,
+  /// else the visible tab.
+  unsafe fn follow_focus(&mut self, xlib: &xlib::Xlib) {
+    let (mut focus, mut revert) = (0, 0);
+    (xlib.XGetInputFocus)(self.display, &mut focus, &mut revert);
+    let recheck = self.recheck_at.is_some_and(|at| Instant::now() >= at);
+    if focus == self.last_focus && !recheck {
+      return;
+    }
+    self.last_focus = focus;
+    self.recheck_at = None;
+    if focus <= 1 || focus == (xlib.XDefaultRootWindow)(self.display) {
+      return;
+    }
+    let parents: Vec<(xlib::Window, HashSet<xlib::Window>)> = self
+      .parents
+      .iter()
+      .map(|(p, c)| (*p, c.clone()))
+      .collect();
+    for (parent, children) in &parents {
+      if let Some(child) = children
+        .iter()
+        .copied()
+        .find(|child| is_within(xlib, self.display, focus, *child))
+      {
+        self.focused_child.insert(*parent, child);
+        return;
+      }
+    }
+    // Focus on the parent or on the window manager's frame around it.
+    let Some((parent, children)) = parents
+      .iter()
+      .find(|(parent, _)| is_within(xlib, self.display, *parent, focus))
+    else {
+      return;
+    };
+    self.recheck_at = Some(Instant::now() + RECHECK_EVERY);
+    if self.last_handoff.is_some_and(|at| at.elapsed() < HANDOFF_COOLDOWN) {
+      return;
+    }
+    let viewable_child =
+      |w: xlib::Window| children.contains(&w) && is_viewable(xlib, self.display, w);
+    let under_pointer =
+      child_under_pointer(xlib, self.display, *parent).filter(|w| viewable_child(*w));
+    let remembered = self
+      .focused_child
+      .get(parent)
+      .copied()
+      .filter(|w| viewable_child(*w));
+    let (shell, tab) = shell_and_tab(xlib, self.display, *parent, children);
+    let Some(browser) = handoff_target(under_pointer, remembered, shell, tab) else {
+      return;
+    };
+    // CefWindowX11::Focus gives focus to the CEF window's only child, Chromium's
+    // own window; the CEF window itself would leave the tab pointer-focused.
+    let Some(inner) = only_child(xlib, self.display, browser)
+      .filter(|w| is_viewable(xlib, self.display, *w))
+    else {
+      return;
+    };
+    (xlib.XSetInputFocus)(self.display, inner, xlib::RevertToParent, xlib::CurrentTime);
+    (xlib.XFlush)(self.display);
+    eprintln!("[tauri-cef] focus handed from parent={parent} to browser={browser} (window {inner})");
+    self.last_handoff = Some(Instant::now());
+    // Normally the next frame sees focus inside the browser; if it is still on
+    // the parent then, try once more after the cooldown.
+    self.recheck_at = Some(Instant::now() + HANDOFF_COOLDOWN);
+  }
+}
+
+/// Which browser gets focus that landed on its parent.
+fn handoff_target(
+  under_pointer: Option<xlib::Window>,
+  remembered: Option<xlib::Window>,
+  shell: Option<xlib::Window>,
+  tab: Option<xlib::Window>,
+) -> Option<xlib::Window> {
+  under_pointer.or(remembered).or(shell).or(tab)
+}
+
+/// Whether `window` is `ancestor` or lies inside it. None (0) and PointerRoot (1) are never inside.
+unsafe fn is_within(
+  xlib: &xlib::Xlib,
+  display: *mut xlib::Display,
+  mut window: xlib::Window,
+  ancestor: xlib::Window,
+) -> bool {
+  for _ in 0..64 {
+    if window <= 1 || ancestor <= 1 {
+      return false;
+    }
+    if window == ancestor {
+      return true;
+    }
+    match children_of(xlib, display, window) {
+      Some((parent, _)) if parent > 1 => window = parent,
+      _ => return false,
+    }
+  }
+  false
+}
+
+unsafe fn is_viewable(xlib: &xlib::Xlib, display: *mut xlib::Display, window: xlib::Window) -> bool {
+  let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
+  (xlib.XGetWindowAttributes)(display, window, &mut attrs) != 0 && attrs.map_state == xlib::IsViewable
+}
+
+/// The child of `window` exactly when there is one, as CEF's FindChild.
+unsafe fn only_child(
+  xlib: &xlib::Xlib,
+  display: *mut xlib::Display,
+  window: xlib::Window,
+) -> Option<xlib::Window> {
+  match children_of(xlib, display, window)?.1.as_slice() {
+    [child] => Some(*child),
+    _ => None,
+  }
+}
+
+/// The child of `parent` that contains the pointer, if the pointer is in one.
+unsafe fn child_under_pointer(
+  xlib: &xlib::Xlib,
+  display: *mut xlib::Display,
+  parent: xlib::Window,
+) -> Option<xlib::Window> {
+  let (mut root, mut child, mut root_x, mut root_y, mut x, mut y, mut mask) = (0, 0, 0, 0, 0, 0, 0u32);
+  let same_screen = (xlib.XQueryPointer)(
+    display, parent, &mut root, &mut child, &mut root_x, &mut root_y, &mut x, &mut y, &mut mask,
+  );
+  (same_screen != 0 && child > 1).then_some(child)
+}
+
+/// The full-size shell browser and the visible inset tab among `children`.
+unsafe fn shell_and_tab(
+  xlib: &xlib::Xlib,
+  display: *mut xlib::Display,
+  parent: xlib::Window,
+  children: &HashSet<xlib::Window>,
+) -> (Option<xlib::Window>, Option<xlib::Window>) {
+  let mut parent_attrs: xlib::XWindowAttributes = std::mem::zeroed();
+  if (xlib.XGetWindowAttributes)(display, parent, &mut parent_attrs) == 0 {
+    return (None, None);
+  }
+  let (mut shell, mut tab) = (None, None);
+  for child in children {
+    let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
+    if (xlib.XGetWindowAttributes)(display, *child, &mut attrs) == 0 || attrs.map_state != xlib::IsViewable {
+      continue;
+    }
+    if looks_like_inset(&attrs, &parent_attrs) {
+      tab = tab.or(Some(*child));
+    } else if !looks_like_angle(&attrs, &parent_attrs) {
+      shell = shell.or(Some(*child));
+    }
+  }
+  (shell, tab)
 }
 
 impl Drop for ChildStackingGuard {
@@ -443,6 +629,18 @@ mod tests {
     assert_eq!(raise_shell, vec![1]);
     assert_eq!(raise_tabs, vec![2]);
     assert!(!stacking_ok(&children));
+  }
+
+  #[test]
+  fn focus_on_the_window_goes_where_the_person_is() {
+    // The pointer is over a browser: that one, as CEF itself would pick.
+    assert_eq!(handoff_target(Some(3), Some(2), Some(1), Some(4)), Some(3));
+    // Back through the title bar or Alt+Tab: the browser that had focus before.
+    assert_eq!(handoff_target(None, Some(2), Some(1), Some(4)), Some(2));
+    // Nothing had focus yet (start-up): the shell, whose new tab focuses the address bar.
+    assert_eq!(handoff_target(None, None, Some(1), Some(4)), Some(1));
+    assert_eq!(handoff_target(None, None, None, Some(4)), Some(4));
+    assert_eq!(handoff_target(None, None, None, None), None);
   }
 
   #[test]
