@@ -13,7 +13,13 @@ mod linux;
 mod linux_stacking;
 
 #[cfg(target_os = "linux")]
+mod linux_popup;
+
+#[cfg(target_os = "linux")]
 pub(crate) use linux_stacking::process_events as process_native_child_stacking_events;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux_popup::{adopt as adopt_popup, retitle as retitle_popup};
 
 #[derive(Clone)]
 pub enum CefWebview {

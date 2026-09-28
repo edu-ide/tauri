@@ -41,6 +41,22 @@ pub(super) fn register(parent: xlib::Window, child: xlib::Window) {
   });
 }
 
+/// Bring `window` forward once the window manager has shown it (a page's popup; see linux_popup).
+pub(super) fn present_when_shown(window: xlib::Window) {
+  if window <= 1 {
+    return;
+  }
+  GUARD.with(|guard| {
+    let mut guard = guard.borrow_mut();
+    if guard.is_none() {
+      *guard = ChildStackingGuard::new();
+    }
+    if let Some(guard) = guard.as_mut() {
+      guard.present.push((window, Instant::now() + PRESENT_WITHIN));
+    }
+  });
+}
+
 pub(super) fn unregister(child: xlib::Window) {
   GUARD.with(|guard| {
     if let Some(guard) = guard.borrow_mut().as_mut() {
@@ -68,11 +84,15 @@ struct ChildStackingGuard {
   /// While focus sits on a parent with no browser to hand it to yet, look again at this time.
   recheck_at: Option<Instant>,
   last_handoff: Option<Instant>,
+  /// Popup windows to bring forward once shown, each until its deadline.
+  present: Vec<(xlib::Window, Instant)>,
 }
 
 /// Something that keeps pulling focus back to the parent gets one handoff per this long, not a fight every frame.
 const HANDOFF_COOLDOWN: Duration = Duration::from_millis(500);
 const RECHECK_EVERY: Duration = Duration::from_millis(100);
+/// A popup that is still not shown this long after it was created is left to the window manager.
+const PRESENT_WITHIN: Duration = Duration::from_secs(10);
 
 impl ChildStackingGuard {
   fn new() -> Option<Self> {
@@ -86,6 +106,7 @@ impl ChildStackingGuard {
       focused_child: HashMap::new(),
       recheck_at: None,
       last_handoff: None,
+      present: Vec::new(),
     })
   }
 
@@ -153,7 +174,26 @@ impl ChildStackingGuard {
         let _ = repair_parent(xlib, self.display, parent, &children);
       }
       self.follow_focus(xlib);
+      self.present_shown(xlib);
     }
+  }
+
+  /// Activate each waiting popup once it is viewable. The popup is not a registered parent, so
+  /// `follow_focus` leaves the focus it gets alone, and WM_TRANSIENT_FOR keeps it above the app
+  /// window when the app window is clicked again.
+  unsafe fn present_shown(&mut self, xlib: &xlib::Xlib) {
+    if self.present.is_empty() {
+      return;
+    }
+    let (display, now) = (self.display, Instant::now());
+    self.present.retain(|&(window, until)| {
+      if is_viewable(xlib, display, window) {
+        activate(xlib, display, window);
+        eprintln!("[tauri-cef] popup window {window} brought forward");
+        return false;
+      }
+      now < until
+    });
   }
 
   /// GNOME gives X focus to the app's own toplevel when the person comes back
@@ -270,6 +310,31 @@ unsafe fn is_within(
 unsafe fn is_viewable(xlib: &xlib::Xlib, display: *mut xlib::Display, window: xlib::Window) -> bool {
   let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
   (xlib.XGetWindowAttributes)(display, window, &mut attrs) != 0 && attrs.map_state == xlib::IsViewable
+}
+
+/// Ask the window manager to raise and focus a top-level window. The popup follows a click the
+/// person just made, so the request says it comes from a pager (source 2), which window managers
+/// do not hold back as focus stealing; XRaiseWindow covers one without EWMH.
+unsafe fn activate(xlib: &xlib::Xlib, display: *mut xlib::Display, window: xlib::Window) {
+  let root = (xlib.XDefaultRootWindow)(display);
+  let name = std::ffi::CString::new("_NET_ACTIVE_WINDOW").expect("atom names have no NUL");
+  let mut message: xlib::XClientMessageEvent = std::mem::zeroed();
+  message.type_ = xlib::ClientMessage;
+  message.window = window;
+  message.message_type = (xlib.XInternAtom)(display, name.as_ptr(), xlib::False);
+  message.format = 32;
+  message.data.set_long(0, 2);
+  message.data.set_long(1, xlib::CurrentTime as std::os::raw::c_long);
+  let mut event = xlib::XEvent { client_message: message };
+  (xlib.XSendEvent)(
+    display,
+    root,
+    xlib::False,
+    xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask,
+    &mut event,
+  );
+  (xlib.XRaiseWindow)(display, window);
+  (xlib.XFlush)(display);
 }
 
 /// The child of `window` exactly when there is one, as CEF's FindChild.

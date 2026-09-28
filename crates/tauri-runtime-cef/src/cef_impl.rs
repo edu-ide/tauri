@@ -578,9 +578,21 @@ wrap_display_handler! {
   impl DisplayHandler {
     fn on_title_change(
       &self,
-      _browser: Option<&mut Browser>,
+      browser: Option<&mut Browser>,
       title: Option<&CefString>,
     ) {
+      // A popup shares its opener's client. Its title names its own window, not the opener's webview.
+      #[cfg(target_os = "linux")]
+      if let Some(browser) = browser.as_deref() {
+        if browser.is_popup() == 1 {
+          if let Some(title) = title {
+            crate::cef_webview::retitle_popup(browser, &title.to_string());
+          }
+          return;
+        }
+      }
+      #[cfg(not(target_os = "linux"))]
+      let _ = browser;
       let Some(handler) = &self.document_title_changed_handler else { return };
       let Some(title) = title else { return };
       let title_str = title.to_string();
@@ -835,6 +847,21 @@ wrap_life_span_handler! {
   impl LifeSpanHandler {
     fn on_after_created(&self, browser: Option<&mut Browser>) {
       if let Some(browser) = browser {
+        // A page's popup (window.open) shares its opener's client and so this handler. The
+        // opener's initial URL and renderer observer are not the popup's: reloading a popup
+        // that is still blank with that URL breaks pages that open an empty window and post a
+        // form into it.
+        if browser.is_popup() == 1 {
+          #[cfg(target_os = "linux")]
+          {
+            let owner = self.context.windows.try_borrow().ok().and_then(|windows| {
+              let window = windows.get(&self.window_id)?.window()?;
+              Some(window.window_handle() as x11_dl::xlib::Window)
+            });
+            crate::cef_webview::adopt_popup(browser, owner);
+          }
+          return;
+        }
         request_handler::install_renderer_crash_observer(
           browser,
           self.recovery_origin.as_ref(),
@@ -1065,7 +1092,9 @@ wrap_client! {
     }
 
     fn display_handler(&self) -> Option<DisplayHandler> {
-      if self.document_title_changed_handler.is_some() {
+      // On Linux a page's popup window is named after its page (cef_webview::linux_popup), so
+      // the handler is needed even by webviews that do not listen for title changes.
+      if self.document_title_changed_handler.is_some() || cfg!(target_os = "linux") {
         Some(BrowserDisplayHandler::new(
           self.document_title_changed_handler.clone(),
         ))
