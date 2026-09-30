@@ -1241,16 +1241,24 @@ wrap_window_delegate! {
       _window: Option<&mut Window>,
       properties: Option<&mut LinuxWindowProperties>,
     ) -> i32 {
-      let Some(properties) = properties else {
+      #[cfg(not(target_os = "linux"))]
+      {
+        let _ = properties;
         return 0;
-      };
-      // CEF Views does not inherit GTK's application ID. Supply the desktop
-      // entry ID explicitly so Wayland and X11 can resolve the app's icon.
-      let app_id = self.context.application_id.as_str();
-      properties.wayland_app_id = linux_window_property_string(app_id);
-      properties.wm_class_class = linux_window_property_string(app_id);
-      properties.wm_class_name = linux_window_property_string(app_id);
-      1
+      }
+      #[cfg(target_os = "linux")]
+      {
+        let Some(properties) = properties else {
+          return 0;
+        };
+        // CEF Views does not inherit GTK's application ID. Supply the desktop
+        // entry ID explicitly so Wayland and X11 can resolve the app's icon.
+        let app_id = self.context.application_id.as_str();
+        properties.wayland_app_id = linux_window_property_string(app_id);
+        properties.wm_class_class = linux_window_property_string(app_id);
+        properties.wm_class_name = linux_window_property_string(app_id);
+        1
+      }
     }
 
     fn on_window_created(&self, window: Option<&mut Window>) {
