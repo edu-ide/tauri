@@ -323,7 +323,7 @@ fn apply_window_theme(window: &cef::Window, theme: Option<tauri_utils::Theme>) {
     let dark_mode: i32 = match theme {
       Some(tauri_utils::Theme::Dark) => 1,
       Some(tauri_utils::Theme::Light) => 0,
-      None => 0,
+      Some(_) | None => 0,
     };
 
     unsafe {
