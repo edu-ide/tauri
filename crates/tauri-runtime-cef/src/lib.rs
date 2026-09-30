@@ -2176,7 +2176,8 @@ impl<T: UserEvent> CefRuntime<T> {
       #[cfg(any(target_os = "linux", target_os = "windows"))]
       locales_dir_path: cef_locales_dir.to_string_lossy().to_string().as_str().into(),
       log_severity: cef::LogSeverity::VERBOSE,
-      log_file: current_exe_dir.join("cef.log").to_string_lossy().to_string().as_str().into(),
+      // Keep runtime writes outside the signed app bundle and installation directory.
+      log_file: cache_path.join("cef.log").to_string_lossy().to_string().as_str().into(),
       ..Default::default()
     };
     let init_result = cef::initialize(
