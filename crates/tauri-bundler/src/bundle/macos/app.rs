@@ -829,7 +829,80 @@ fn copy_cef_framework(bundle_directory: &Path, cef_path: &Path) -> crate::Result
     )
   })?;
 
+  link_cef_gpu_libraries(bundle_directory, &framework_dst)?;
+
   Ok(framework_dst)
+}
+
+/// CEF runs GPU subprocesses through the main executable and looks beside it
+/// for ANGLE/SwiftShader libraries. Keep their actual files in the framework.
+fn link_cef_gpu_libraries(
+  bundle_directory: &Path,
+  framework_directory: &Path,
+) -> crate::Result<()> {
+  const GPU_LIBRARIES: [&str; 3] = ["libEGL.dylib", "libGLESv2.dylib", "libvk_swiftshader.dylib"];
+  let bundle_root = fs::canonicalize(bundle_directory)?;
+  let framework_root = fs::canonicalize(framework_directory)?;
+  if !framework_root.starts_with(&bundle_root) {
+    return Err(GenericError("CEF framework escapes the app bundle".into()));
+  }
+
+  let bin_directory = bundle_directory.join("MacOS");
+  fs::create_dir_all(&bin_directory)?;
+  if fs::canonicalize(&bin_directory)? != bundle_root.join("MacOS") {
+    return Err(GenericError(
+      "CEF executable directory must not be a symlink".into(),
+    ));
+  }
+
+  // Validate every source and destination before creating any new links.
+  let mut missing_links = Vec::new();
+  for name in GPU_LIBRARIES {
+    let library = framework_directory.join("Libraries").join(name);
+    match fs::symlink_metadata(&library) {
+      Ok(_) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+      Err(error) => return Err(error.into()),
+    }
+    let library_target = fs::canonicalize(&library)?;
+    if !library_target.starts_with(&framework_root) || !library_target.is_file() {
+      return Err(GenericError(format!(
+        "CEF GPU library must be a file inside the bundled framework: {}",
+        library.display()
+      )));
+    }
+
+    let link = bin_directory.join(name);
+    let target = PathBuf::from("../Frameworks")
+      .join(CEF_FRAMEWORK)
+      .join("Libraries")
+      .join(name);
+    match fs::symlink_metadata(&link) {
+      Ok(metadata)
+        if metadata.file_type().is_symlink()
+          && fs::read_link(&link)? == target
+          && fs::canonicalize(&link)? == library_target => {}
+      Ok(_) => {
+        return Err(GenericError(format!(
+          "CEF GPU library link conflicts with an existing bundle path: {}",
+          link.display()
+        )));
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        missing_links.push((link, target));
+      }
+      Err(error) => return Err(error.into()),
+    }
+  }
+  for (link, target) in missing_links {
+    std::os::unix::fs::symlink(target, &link).with_context(|| {
+      format!(
+        "Failed to link bundled CEF GPU library at {}",
+        link.display()
+      )
+    })?;
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -841,6 +914,123 @@ mod tests {
     fs,
     path::{Path, PathBuf},
   };
+
+  fn create_cef_framework(directory: &Path) -> PathBuf {
+    let framework = directory.join(CEF_FRAMEWORK);
+    fs::create_dir_all(framework.join("Libraries")).unwrap();
+    framework
+  }
+
+  #[test]
+  fn test_copy_cef_framework_links_only_present_gpu_libraries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("cef");
+    let framework = create_cef_framework(&source);
+    for name in ["libEGL.dylib", "libGLESv2.dylib", "libcef_sandbox.dylib"] {
+      fs::write(framework.join("Libraries").join(name), name).unwrap();
+    }
+    let contents = tmp.path().join("Computer.app/Contents");
+    fs::create_dir_all(&contents).unwrap();
+    let bundled = copy_cef_framework(&contents, &source).unwrap();
+    for name in ["libEGL.dylib", "libGLESv2.dylib"] {
+      let link = contents.join("MacOS").join(name);
+      let target = fs::read_link(&link).unwrap();
+      assert!(!target.is_absolute());
+      assert_eq!(
+        target,
+        PathBuf::from("../Frameworks")
+          .join(CEF_FRAMEWORK)
+          .join("Libraries")
+          .join(name)
+      );
+      assert_eq!(
+        fs::canonicalize(&link).unwrap(),
+        fs::canonicalize(bundled.join("Libraries").join(name)).unwrap()
+      );
+      assert!(fs::canonicalize(&link)
+        .unwrap()
+        .starts_with(fs::canonicalize(&contents).unwrap()));
+      assert_eq!(fs::read_to_string(link).unwrap(), name);
+    }
+    assert!(!contents.join("MacOS/libvk_swiftshader.dylib").exists());
+    assert!(!contents.join("MacOS/libcef_sandbox.dylib").exists());
+
+    // Re-copying the framework must keep the same valid links usable.
+    copy_cef_framework(&contents, &source).unwrap();
+    assert_eq!(
+      fs::read_to_string(contents.join("MacOS/libGLESv2.dylib")).unwrap(),
+      "libGLESv2.dylib"
+    );
+  }
+
+  #[test]
+  fn test_cef_gpu_link_conflicts_preserve_existing_paths() {
+    for kind in ["file", "directory", "wrong_symlink", "absolute_symlink"] {
+      let tmp = tempfile::tempdir().unwrap();
+      let contents = tmp.path().join("Computer.app/Contents");
+      let framework = create_cef_framework(&contents.join("Frameworks"));
+      for name in ["libEGL.dylib", "libGLESv2.dylib"] {
+        fs::write(framework.join("Libraries").join(name), name).unwrap();
+      }
+      let bin = contents.join("MacOS");
+      fs::create_dir_all(&bin).unwrap();
+      let conflict = bin.join("libGLESv2.dylib");
+      match kind {
+        "file" => fs::write(&conflict, "preserve me").unwrap(),
+        "directory" => fs::create_dir(&conflict).unwrap(),
+        "wrong_symlink" => std::os::unix::fs::symlink("other-library", &conflict).unwrap(),
+        "absolute_symlink" => {
+          std::os::unix::fs::symlink(framework.join("Libraries/libGLESv2.dylib"), &conflict)
+            .unwrap()
+        }
+        _ => unreachable!(),
+      }
+      let error = link_cef_gpu_libraries(&contents, &framework).unwrap_err();
+      assert!(error.to_string().contains("conflicts"), "{kind}: {error}");
+      assert!(
+        !bin.join("libEGL.dylib").exists(),
+        "preflight must not create partial links"
+      );
+      match kind {
+        "file" => assert_eq!(fs::read_to_string(conflict).unwrap(), "preserve me"),
+        "directory" => assert!(conflict.is_dir()),
+        "wrong_symlink" => assert_eq!(
+          fs::read_link(conflict).unwrap(),
+          PathBuf::from("other-library")
+        ),
+        "absolute_symlink" => assert!(fs::read_link(conflict).unwrap().is_absolute()),
+        _ => unreachable!(),
+      }
+    }
+  }
+
+  #[test]
+  fn test_cef_gpu_links_reject_external_library_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let contents = tmp.path().join("Computer.app/Contents");
+    let framework = create_cef_framework(&contents.join("Frameworks"));
+    let outside = tmp.path().join("outside.dylib");
+    fs::write(&outside, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside, framework.join("Libraries/libGLESv2.dylib")).unwrap();
+    let error = link_cef_gpu_libraries(&contents, &framework).unwrap_err();
+    assert!(error.to_string().contains("inside the bundled framework"));
+    assert!(!contents.join("MacOS/libGLESv2.dylib").exists());
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+  }
+
+  #[test]
+  fn test_cef_gpu_links_reject_redirected_executable_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let contents = tmp.path().join("Computer.app/Contents");
+    let framework = create_cef_framework(&contents.join("Frameworks"));
+    fs::write(framework.join("Libraries/libGLESv2.dylib"), "GPU").unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, contents.join("MacOS")).unwrap();
+    let error = link_cef_gpu_libraries(&contents, &framework).unwrap_err();
+    assert!(error.to_string().contains("must not be a symlink"));
+    assert!(!outside.join("libGLESv2.dylib").exists());
+  }
 
   /// Helper that builds a `Settings` instance and bundle directory for tests.
   /// It receives a mapping of bundle-relative paths to source paths and
