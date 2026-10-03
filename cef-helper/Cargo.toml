@@ -15,5 +15,8 @@ default = ["sandbox"]
 # Mirrors `tauri-runtime-cef` default feature to enable CEF sandbox support on macOS.
 sandbox = ["cef/sandbox"]
 
+[patch.crates-io]
+cef-dll-sys = { path = "../vendor/cef-dll-sys" }
+
 # Ensure this crate is NOT treated as part of the repo workspace.
 [workspace]

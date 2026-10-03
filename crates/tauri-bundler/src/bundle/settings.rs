@@ -126,7 +126,8 @@ const ALL_PACKAGE_TYPES: &[PackageType] = &[
   PackageType::IosBundle,
   #[cfg(target_os = "windows")]
   PackageType::WindowsMsi,
-  #[cfg(target_os = "windows")]
+  // NSIS can package a prebuilt Windows binary on a Linux host.
+  #[cfg(any(target_os = "linux", target_os = "windows"))]
   PackageType::Nsis,
   #[cfg(target_os = "macos")]
   PackageType::MacOsBundle,

@@ -142,7 +142,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     let cef_framework_path = copy_cef_framework(&bundle_directory, cef_path)?;
     // Add CEF framework to sign paths
     add_framework_sign_path(
-      &cef_path.join(CEF_FRAMEWORK),
+      &cef_framework_source(cef_path)?,
       &cef_framework_path,
       &mut sign_paths,
     );
@@ -798,14 +798,39 @@ fn create_cef_helpers(
 
 /// Copies the CEF framework from cef_path to the app bundle.
 /// Returns the path to the copied framework.
-fn copy_cef_framework(bundle_directory: &Path, cef_path: &Path) -> crate::Result<PathBuf> {
-  let framework_src = cef_path.join(CEF_FRAMEWORK);
-  if !framework_src.exists() {
+fn cef_framework_source(cef_path: &Path) -> crate::Result<PathBuf> {
+  let framework_src = if cef_path.ends_with(CEF_FRAMEWORK) {
+    cef_path.to_path_buf()
+  } else if cef_path.join("CMakeLists.txt").is_file() {
+    cef_path.join("Release").join(CEF_FRAMEWORK)
+  } else {
+    cef_path.join(CEF_FRAMEWORK)
+  };
+  if !framework_src.is_dir() {
     return Err(GenericError(format!(
       "CEF framework not found at {}",
       framework_src.display()
     )));
   }
+  let framework_root = fs::canonicalize(&framework_src)?;
+  for required in [
+    CEF_FRAMEWORK.trim_end_matches(".framework"),
+    "Resources/Info.plist",
+  ] {
+    let file = framework_src.join(required);
+    if !file.is_file() || !fs::canonicalize(&file)?.starts_with(&framework_root) {
+      return Err(GenericError(format!(
+        "CEF framework is incomplete: {} must be a file inside {}",
+        file.display(),
+        framework_src.display()
+      )));
+    }
+  }
+  Ok(framework_src)
+}
+
+fn copy_cef_framework(bundle_directory: &Path, cef_path: &Path) -> crate::Result<PathBuf> {
+  let framework_src = cef_framework_source(cef_path)?;
 
   let frameworks_dir = bundle_directory.join("Frameworks");
   fs::create_dir_all(&frameworks_dir).fs_context(
@@ -895,12 +920,8 @@ fn link_cef_gpu_libraries(
     }
   }
   for (link, target) in missing_links {
-    std::os::unix::fs::symlink(target, &link).with_context(|| {
-      format!(
-        "Failed to link bundled CEF GPU library at {}",
-        link.display()
-      )
-    })?;
+    std::os::unix::fs::symlink(target, &link)
+      .fs_context("Failed to link bundled CEF GPU library", &link)?;
   }
   Ok(())
 }
@@ -918,7 +939,31 @@ mod tests {
   fn create_cef_framework(directory: &Path) -> PathBuf {
     let framework = directory.join(CEF_FRAMEWORK);
     fs::create_dir_all(framework.join("Libraries")).unwrap();
+    fs::create_dir_all(framework.join("Resources")).unwrap();
+    fs::write(framework.join("Chromium Embedded Framework"), "CEF").unwrap();
+    fs::write(framework.join("Resources/Info.plist"), "plist").unwrap();
     framework
+  }
+
+  #[test]
+  fn test_cef_framework_paths_require_complete_internal_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let framework = create_cef_framework(&tmp.path().join("Release"));
+    fs::write(tmp.path().join("CMakeLists.txt"), "project(cef)").unwrap();
+    for path in [tmp.path(), &tmp.path().join("Release"), &framework] {
+      assert_eq!(cef_framework_source(path).unwrap(), framework);
+    }
+    fs::remove_file(framework.join("Chromium Embedded Framework")).unwrap();
+    let contents = tmp.path().join("Computer.app/Contents");
+    assert!(copy_cef_framework(&contents, tmp.path())
+      .unwrap_err()
+      .to_string()
+      .contains("incomplete"));
+    assert!(!contents.exists());
+    let outside = tmp.path().join("external-cef");
+    fs::write(&outside, "CEF").unwrap();
+    std::os::unix::fs::symlink(outside, framework.join("Chromium Embedded Framework")).unwrap();
+    assert!(cef_framework_source(tmp.path()).is_err());
   }
 
   #[test]

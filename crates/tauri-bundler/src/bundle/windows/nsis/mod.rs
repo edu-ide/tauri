@@ -30,7 +30,7 @@ use std::{
   collections::BTreeMap,
   fs,
   path::{Path, PathBuf},
-  process::Command,
+  process::{Command, ExitStatus},
 };
 
 // URLS for the NSIS toolchain.
@@ -646,7 +646,7 @@ fn build_nsis_app_installer(
     nsis_cmd.env("NSISPLUGINS", plugins_path);
   }
 
-  nsis_cmd
+  let status = nsis_cmd
     .args(["-INPUTCHARSET", "UTF8", "-OUTPUTCHARSET", "UTF8"])
     .arg(match settings.log_level() {
       log::Level::Error => "-V1",
@@ -663,6 +663,7 @@ fn build_nsis_app_installer(
       command: "makensis.exe".to_string(),
       error,
     })?;
+  check_nsis_exit_status(status)?;
 
   fs::rename(nsis_output_path, &nsis_installer_path)?;
 
@@ -674,6 +675,15 @@ fn build_nsis_app_installer(
   }
 
   Ok(vec![nsis_installer_path])
+}
+
+fn check_nsis_exit_status(status: ExitStatus) -> crate::Result<()> {
+  if !status.success() {
+    return Err(Error::GenericError(format!(
+      "makensis failed with {status}; installer was not generated"
+    )));
+  }
+  Ok(())
 }
 
 fn handlebars_or(
@@ -732,6 +742,71 @@ fn handlebars_no_escape(
 
 /// BTreeMap<OriginalPath, (ParentOfTargetPath, TargetPath)>
 type ResourcesMap = BTreeMap<PathBuf, (PathBuf, PathBuf)>;
+
+fn cef_resource_files(directory: &Path) -> crate::Result<Vec<(PathBuf, PathBuf)>> {
+  // The minimal CEF distribution does not contain sandbox bootstrap executables
+  // or every optional rendering backend. Include those only when shipped.
+  let required = [
+    "libcef.dll",
+    "chrome_elf.dll",
+    "icudtl.dat",
+    "v8_context_snapshot.bin",
+  ];
+  let optional = [
+    "chrome_100_percent.pak",
+    "chrome_200_percent.pak",
+    "resources.pak",
+    "d3dcompiler_47.dll",
+    "dxil.dll",
+    "dxcompiler.dll",
+    "libEGL.dll",
+    "libGLESv2.dll",
+    "vk_swiftshader.dll",
+    "vk_swiftshader_icd.json",
+    "vulkan-1.dll",
+    "bootstrap.exe",
+    "bootstrapc.exe",
+    "LICENSE.txt",
+  ];
+  let mut files = Vec::new();
+  for name in required {
+    let path = directory.join(name);
+    if !path.is_file() {
+      return Err(Error::GenericError(format!(
+        "Missing required CEF resource: {}",
+        path.display()
+      )));
+    }
+    files.push((path, PathBuf::from(name)));
+  }
+  for name in optional {
+    let path = directory.join(name);
+    if path.is_file() {
+      files.push((path, PathBuf::from(name)));
+    }
+  }
+  let locales = directory.join("locales");
+  if !locales.join("en-US.pak").is_file() {
+    return Err(Error::GenericError(format!(
+      "Missing required CEF locale: {}",
+      locales.join("en-US.pak").display()
+    )));
+  }
+  // Ship all available locales instead of assuming gender-specific English
+  // files exist in every CEF version/distribution.
+  let mut locale_files = fs::read_dir(&locales)?
+    .map(|entry| entry.map(|entry| entry.path()))
+    .collect::<std::io::Result<Vec<_>>>()?;
+  locale_files.sort();
+  for path in locale_files {
+    if path.is_file() && path.extension().is_some_and(|extension| extension == "pak") {
+      let target = PathBuf::from("locales").join(path.file_name().unwrap());
+      files.push((path, target));
+    }
+  }
+  Ok(files)
+}
+
 fn generate_resource_data(settings: &Settings) -> crate::Result<ResourcesMap> {
   let mut resources = ResourcesMap::new();
 
@@ -758,59 +833,14 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourcesMap> {
   // Handle CEF support if cef_path is set,
   // using https://github.com/chromiumembedded/cef/blob/master/tools/distrib/win/README.redistrib.txt as a reference
   if settings.bundle_settings().cef_path.is_some() {
-    let cef_files = [
-      // required
-      "libcef.dll",
-      "chrome_elf.dll",
-      "icudtl.dat",
-      "v8_context_snapshot.bin",
-      // required end
-      // "optional" - but not really since we want support for all of this
-      "chrome_100_percent.pak",
-      "chrome_200_percent.pak",
-      "resources.pak",
-      // Direct3D support
-      "d3dcompiler_47.dll",
-      // DirectX compiler support
-      // TODO: check if x64 means no arm64
-      "dxil.dll",
-      "dxcompiler.dll",
-      // ANGEL support
-      "libEGL.dll",
-      "libGLESv2.dll",
-      // SwANGLE support
-      "vk_swiftshader.dll",
-      "vk_swiftshader_icd.json",
-      "vulkan-1.dll",
-      // sandbox - may need to be behind a setting?
-      "bootstrap.exe",
-      "bootstrapc.exe",
-    ];
-
-    for f in &cef_files {
-      let src_path = dunce::simplified(&settings.project_out_directory().join(f)).to_path_buf();
+    for (src_path, target_file) in cef_resource_files(settings.project_out_directory())? {
+      let src_path = dunce::simplified(&src_path).to_path_buf();
       if settings.windows().can_sign() && should_sign(&src_path)? {
         try_sign(&src_path, settings)?;
       }
       added_resources.push(src_path.clone());
-      resources.insert(src_path, (PathBuf::new(), PathBuf::from(f)));
-    }
-
-    // TODO: locales?
-    // crash without at least en
-    let locales = [
-      "en-US.pak",
-      "en-US_FEMININE.pak",
-      "en-US_MASCULINE.pak",
-      "en-US_NEUTER.pak",
-    ];
-
-    for f in &locales {
-      let target_file = PathBuf::from("locales").join(f);
-      let src_path =
-        dunce::simplified(&settings.project_out_directory().join(&target_file)).to_path_buf();
-      added_resources.push(src_path.clone());
-      resources.insert(src_path, (PathBuf::from("locales"), target_file));
+      let parent = target_file.parent().unwrap().to_path_buf();
+      resources.insert(src_path, (parent, target_file));
     }
   }
 
@@ -941,4 +971,120 @@ fn write_utf8_with_bom<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, content: C) -> c
   output.write_all(&[0xEF, 0xBB, 0xBF])?; // UTF-8 BOM
   output.write_all(content.as_ref())?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[cfg(unix)]
+  #[test]
+  fn failed_or_interrupted_compiler_is_never_successful() {
+    use std::os::unix::process::ExitStatusExt;
+
+    assert!(check_nsis_exit_status(ExitStatus::from_raw(0)).is_ok());
+    for raw in [7 << 8, 15] {
+      let error = check_nsis_exit_status(ExitStatus::from_raw(raw)).unwrap_err();
+      assert!(error.to_string().contains("makensis failed"));
+    }
+  }
+
+  fn minimal_cef() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    for name in [
+      "libcef.dll",
+      "chrome_elf.dll",
+      "icudtl.dat",
+      "v8_context_snapshot.bin",
+    ] {
+      fs::write(directory.path().join(name), []).unwrap();
+    }
+    fs::create_dir(directory.path().join("locales")).unwrap();
+    fs::write(directory.path().join("locales/en-US.pak"), []).unwrap();
+    directory
+  }
+
+  #[test]
+  fn minimal_cef_does_not_require_sandbox_or_gendered_locales() {
+    let directory = minimal_cef();
+    let files = cef_resource_files(directory.path()).unwrap();
+    assert_eq!(files.len(), 5);
+    assert!(files.iter().all(|(source, _)| source.is_file()));
+  }
+
+  #[test]
+  fn cef_includes_available_backends_and_all_locales() {
+    let directory = minimal_cef();
+    for name in [
+      "bootstrap.exe",
+      "resources.pak",
+      "libEGL.dll",
+      "LICENSE.txt",
+    ] {
+      fs::write(directory.path().join(name), []).unwrap();
+    }
+    for name in ["ko.pak", "en-US_FEMININE.pak", "unrelated.txt"] {
+      fs::write(directory.path().join("locales").join(name), []).unwrap();
+    }
+    let targets = cef_resource_files(directory.path())
+      .unwrap()
+      .into_iter()
+      .map(|(_, target)| target)
+      .collect::<Vec<_>>();
+    for name in [
+      "bootstrap.exe",
+      "resources.pak",
+      "libEGL.dll",
+      "LICENSE.txt",
+      "locales/ko.pak",
+      "locales/en-US_FEMININE.pak",
+    ] {
+      assert!(targets.contains(&PathBuf::from(name)));
+    }
+    assert!(!targets.contains(&PathBuf::from("locales/unrelated.txt")));
+  }
+
+  #[test]
+  fn cef_reports_missing_required_binary_and_locale() {
+    let directory = minimal_cef();
+    fs::remove_file(directory.path().join("libcef.dll")).unwrap();
+    assert!(cef_resource_files(directory.path())
+      .unwrap_err()
+      .to_string()
+      .contains("libcef.dll"));
+    fs::write(directory.path().join("libcef.dll"), []).unwrap();
+    fs::remove_file(directory.path().join("locales/en-US.pak")).unwrap();
+    assert!(cef_resource_files(directory.path())
+      .unwrap_err()
+      .to_string()
+      .contains("en-US.pak"));
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn cross_host_nsis_is_available_but_filtered_by_the_target() {
+    use crate::{PackageSettings, PackageType, SettingsBuilder};
+
+    assert!(PackageType::all().contains(&PackageType::Nsis));
+    for (target, expected) in [
+      ("x86_64-pc-windows-msvc", vec![PackageType::Nsis]),
+      ("x86_64-unknown-linux-gnu", vec![PackageType::Deb]),
+    ] {
+      let settings = SettingsBuilder::new()
+        .package_settings(PackageSettings {
+          product_name: "Computer".into(),
+          version: "0.1.0".into(),
+          description: String::new(),
+          homepage: None,
+          authors: None,
+          default_run: None,
+        })
+        .project_out_directory(".")
+        .target(target.into())
+        .package_types(vec![PackageType::Nsis, PackageType::Deb])
+        .build()
+        .unwrap();
+      assert_eq!(settings.package_types().unwrap(), expected);
+    }
+  }
 }
