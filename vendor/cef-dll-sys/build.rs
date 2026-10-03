@@ -238,27 +238,56 @@ fn main() -> anyhow::Result<()> {
         }
         "windows" => {
             let sdk_libs = [
-                "comctl32.lib",
-                "delayimp.lib",
-                "mincore.lib",
-                "powrprof.lib",
-                "propsys.lib",
-                "runtimeobject.lib",
-                "setupapi.lib",
-                "shcore.lib",
-                "shell32.lib",
-                "shlwapi.lib",
-                "user32.lib",
-                "version.lib",
-                "wbemuuid.lib",
-                "winmm.lib",
-            ]
-            .join(" ");
+                "comctl32",
+                "delayimp",
+                "mincore",
+                "powrprof",
+                "propsys",
+                "runtimeobject",
+                "setupapi",
+                "shcore",
+                "shell32",
+                "shlwapi",
+                "user32",
+                "version",
+                "wbemuuid",
+                "winmm",
+            ];
+
+            // CEF clears CMAKE_CXX_FLAGS with Ninja. Cross toolchains keep their
+            // target and SDK include paths there, so preserve them as directory
+            // options before CEF loads its own configuration. clang-cl also
+            // ignores CEF's MSVC-only /MP flag, which becomes fatal under /WX.
+            if env::var("HOST")? != target {
+                let cross_dir = PathBuf::from(env::var("OUT_DIR")?);
+                let cross_include = cross_dir.join("cef-cross-include");
+                fs::create_dir_all(&cross_include)?;
+                // CEF uses this spelling, while the Windows SDK ships SoftPub.h.
+                // Supply a forwarding header on case-sensitive cross-build hosts.
+                fs::write(cross_include.join("Softpub.h"), "#include <SoftPub.h>\n")?;
+                let cross_config = cross_dir.join("cef-cross-flags.cmake");
+                fs::write(
+                    &cross_config,
+                    r#"if(CMAKE_CROSSCOMPILING AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  # Group flags so CMake does not deduplicate repeated /imsvc switches.
+  add_compile_options("SHELL:${CMAKE_CXX_FLAGS}" -Wno-unused-command-line-argument)
+  get_filename_component(CEF_CROSS_DIR "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
+  include_directories("${CEF_CROSS_DIR}/cef-cross-include")
+endif()
+"#,
+                )?;
+                cef_dll_wrapper.define("CMAKE_PROJECT_cef_INCLUDE", cross_config);
+            }
+
+            println!("cargo::rustc-link-search=native={cef_dir}/Release");
+            for library in sdk_libs {
+                println!("cargo::rustc-link-lib=dylib={library}");
+            }
 
             let build_dir = cef_dll_wrapper
                 .define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreaded")
                 .define("CMAKE_OBJECT_PATH_MAX", "500")
-                .define("CMAKE_STATIC_LINKER_FLAGS", &sdk_libs)
+                .define("CMAKE_STATIC_LINKER_FLAGS", "")
                 .define("PROJECT_ARCH", project_arch)
                 .define("USE_SANDBOX", sandbox)
                 .build()
