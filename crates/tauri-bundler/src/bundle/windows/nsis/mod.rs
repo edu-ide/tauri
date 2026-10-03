@@ -446,6 +446,10 @@ fn build_nsis_app_installer(
   data.insert("out_file", to_json(out_file));
 
   let resources = generate_resource_data(settings)?;
+  data.insert(
+    "python_bytecode_caches",
+    to_json(python_bytecode_caches(&resources)),
+  );
   let resources_dirs =
     std::collections::HashSet::<PathBuf>::from_iter(resources.values().map(|r| r.0.to_owned()));
 
@@ -743,6 +747,32 @@ fn handlebars_no_escape(
 /// BTreeMap<OriginalPath, (ParentOfTargetPath, TargetPath)>
 type ResourcesMap = BTreeMap<PathBuf, (PathBuf, PathBuf)>;
 
+fn python_bytecode_caches(resources: &ResourcesMap) -> BTreeMap<String, Vec<String>> {
+  let mut caches = BTreeMap::<String, Vec<String>>::new();
+  for (_, target) in resources.values() {
+    if target
+      .extension()
+      .is_some_and(|extension| extension == "py")
+    {
+      let cache = target.parent().unwrap().join("__pycache__");
+      let pattern = cache.join(format!(
+        "{}.cpython-*.pyc",
+        target.file_stem().unwrap().to_string_lossy()
+      ));
+      let directory = cache.to_string_lossy().replace('/', "\\");
+      caches
+        .entry(directory)
+        .or_default()
+        .push(pattern.to_string_lossy().replace('/', "\\"));
+    }
+  }
+  for patterns in caches.values_mut() {
+    patterns.sort_unstable();
+    patterns.dedup();
+  }
+  caches
+}
+
 fn cef_resource_files(directory: &Path) -> crate::Result<Vec<(PathBuf, PathBuf)>> {
   // The minimal CEF distribution does not contain sandbox bootstrap executables
   // or every optional rendering backend. Include those only when shipped.
@@ -987,6 +1017,47 @@ mod tests {
       let error = check_nsis_exit_status(ExitStatus::from_raw(raw)).unwrap_err();
       assert!(error.to_string().contains("makensis failed"));
     }
+  }
+
+  #[test]
+  fn uninstall_cleans_only_bytecode_for_installed_python_sources() {
+    let resources = ResourcesMap::from([
+      (
+        "agent.py".into(),
+        ("session".into(), "session/agent_paths.py".into()),
+      ),
+      (
+        "nested.py".into(),
+        ("session/tools".into(), "session/tools/tool.py".into()),
+      ),
+      (
+        "document.txt".into(),
+        ("session".into(), "session/document.txt".into()),
+      ),
+    ]);
+    let caches = python_bytecode_caches(&resources);
+    assert_eq!(
+      caches["session\\__pycache__"],
+      vec!["session\\__pycache__\\agent_paths.cpython-*.pyc"]
+    );
+    assert_eq!(
+      caches["session\\tools\\__pycache__"],
+      vec!["session\\tools\\__pycache__\\tool.cpython-*.pyc"]
+    );
+    let mut handlebars = Handlebars::new();
+    handlebars.register_helper("or", Box::new(handlebars_or));
+    handlebars.register_helper("association-description", Box::new(association_description));
+    handlebars.register_helper("no-escape", Box::new(handlebars_no_escape));
+    let script = handlebars
+      .render_template(
+        include_str!("./installer.nsi"),
+        &serde_json::json!({"python_bytecode_caches":caches}),
+      )
+      .unwrap();
+    assert!(script.contains("Delete \"$INSTDIR\\session\\__pycache__\\agent_paths.cpython-*.pyc\""));
+    assert!(script.contains("RMDir \"$INSTDIR\\session\\__pycache__\""));
+    assert!(!script.contains("Delete \"$INSTDIR\\session\\__pycache__\\*.pyc\""));
+    assert!(!script.contains("RMDir /r \"$INSTDIR\\session\\__pycache__\""));
   }
 
   fn minimal_cef() -> tempfile::TempDir {
