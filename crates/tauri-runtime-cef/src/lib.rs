@@ -2162,6 +2162,8 @@ impl<T: UserEvent> CefRuntime<T> {
     let settings = cef::Settings {
       no_sandbox: !cfg!(feature = "sandbox") as i32,
       cache_path: cache_path.to_string_lossy().to_string().as_str().into(),
+      // Keep signed-in sessions in persistent profiles; empty incognito contexts stay in memory.
+      persist_session_cookies: 1,
       #[cfg(target_os = "macos")]
       framework_dir_path: cef_framework.to_string_lossy().to_string().as_str().into(),
       #[cfg(target_os = "macos")]
