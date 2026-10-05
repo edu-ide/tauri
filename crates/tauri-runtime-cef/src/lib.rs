@@ -48,7 +48,38 @@ use crate::cef_webview::CefWebview;
 
 mod cef_impl;
 mod cef_webview;
+#[cfg(target_os = "macos")]
+mod macos_paths;
 mod utils;
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacCefLibrary;
+
+#[cfg(target_os = "macos")]
+impl MacCefLibrary {
+  fn load(framework: &std::path::Path) -> Self {
+    use std::os::unix::ffi::OsStrExt;
+    let library = framework.join("Chromium Embedded Framework");
+    let path =
+      std::ffi::CString::new(library.as_os_str().as_bytes()).expect("invalid CEF framework path");
+    assert!(
+      unsafe { cef::load_library(Some(&*path.as_ptr().cast())) } == 1,
+      "cannot load CEF framework {}",
+      library.display()
+    );
+    Self
+  }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacCefLibrary {
+  fn drop(&mut self) {
+    if cef::unload_library() != 1 {
+      eprintln!("cannot unload CEF framework");
+    }
+  }
+}
 
 #[macro_export]
 macro_rules! getter {
@@ -1853,6 +1884,9 @@ pub struct CefRuntime<T: UserEvent> {
   pub context: RuntimeContext<T>,
   event_tx: std::sync::mpsc::Sender<RunEvent<T>>,
   event_rx: std::sync::mpsc::Receiver<RunEvent<T>>,
+  // Keep dynamically loaded CEF code alive through run() and cef::shutdown().
+  #[cfg(target_os = "macos")]
+  _library: MacCefLibrary,
 }
 
 #[cfg(target_os = "macos")]
@@ -1878,6 +1912,15 @@ impl<T: UserEvent> CefRuntime<T> {
   fn init(runtime_args: RuntimeInitArgs<RuntimeInitAttribute>) -> Self {
     let args = cef::args::Args::new();
 
+    #[cfg(target_os = "macos")]
+    let mac_paths = macos_paths::MacCefPaths::resolve(
+      &std::env::current_exe().unwrap(),
+      std::env::var_os("CEF_PATH")
+        .as_deref()
+        .map(std::path::Path::new),
+    )
+    .expect("invalid macOS CEF bundle or development runtime");
+
     let (event_tx, event_rx) = channel();
 
     #[cfg(target_os = "macos")]
@@ -1895,9 +1938,7 @@ impl<T: UserEvent> CefRuntime<T> {
       #[cfg(not(feature = "sandbox"))]
       let sandbox = ();
 
-      let loader =
-        cef::library_loader::LibraryLoader::new(&std::env::current_exe().unwrap(), is_helper);
-      assert!(loader.load());
+      let loader = MacCefLibrary::load(&mac_paths.framework);
 
       if !is_helper {
         let event_tx_ = event_tx.clone();
@@ -2147,37 +2188,74 @@ impl<T: UserEvent> CefRuntime<T> {
     let cef_resources_dir = cef_runtime_dir.clone();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let cef_locales_dir = cef_runtime_dir.join("locales");
-    #[cfg(target_os = "macos")]
-    let cef_framework = {
-      let nested = cef_runtime_dir.join("Chromium Embedded Framework.framework");
-      if nested.exists() {
-        nested
-      } else if cef_runtime_dir.ends_with("Chromium Embedded Framework.framework") {
-        cef_runtime_dir.clone()
-      } else {
-        current_exe_dir.join("Frameworks/Chromium Embedded Framework.framework")
-      }
-    };
-
     let settings = cef::Settings {
+      #[cfg(not(target_os = "macos"))]
       no_sandbox: !cfg!(feature = "sandbox") as i32,
+      #[cfg(target_os = "macos")]
+      no_sandbox: (!cfg!(feature = "sandbox") || mac_paths.main_bundle.is_none()) as i32,
       cache_path: cache_path.to_string_lossy().to_string().as_str().into(),
+      // Keep signed-in sessions in persistent profiles; empty incognito contexts stay in memory.
+      persist_session_cookies: 1,
       #[cfg(target_os = "macos")]
-      framework_dir_path: cef_framework.to_string_lossy().to_string().as_str().into(),
+      framework_dir_path: mac_paths
+        .framework
+        .to_string_lossy()
+        .to_string()
+        .as_str()
+        .into(),
       #[cfg(target_os = "macos")]
-      main_bundle_path: cef_framework.to_string_lossy().to_string().as_str().into(),
+      main_bundle_path: mac_paths
+        .main_bundle
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .as_str()
+        .into(),
+      #[cfg(not(target_os = "macos"))]
       browser_subprocess_path: current_exe.to_string_lossy().to_string().as_str().into(),
       #[cfg(target_os = "macos")]
-      resources_dir_path: cef_framework.join("Resources").to_string_lossy().to_string().as_str().into(),
+      browser_subprocess_path: mac_paths
+        .subprocess
+        .to_string_lossy()
+        .to_string()
+        .as_str()
+        .into(),
       #[cfg(target_os = "macos")]
-      locales_dir_path: cef_framework.join("Resources/en.lproj").to_string_lossy().to_string().as_str().into(),
+      resources_dir_path: mac_paths
+        .framework
+        .join("Resources")
+        .to_string_lossy()
+        .to_string()
+        .as_str()
+        .into(),
+      #[cfg(target_os = "macos")]
+      locales_dir_path: mac_paths
+        .framework
+        .join("Resources/en.lproj")
+        .to_string_lossy()
+        .to_string()
+        .as_str()
+        .into(),
       #[cfg(any(target_os = "linux", target_os = "windows"))]
-      resources_dir_path: cef_resources_dir.to_string_lossy().to_string().as_str().into(),
+      resources_dir_path: cef_resources_dir
+        .to_string_lossy()
+        .to_string()
+        .as_str()
+        .into(),
       #[cfg(any(target_os = "linux", target_os = "windows"))]
-      locales_dir_path: cef_locales_dir.to_string_lossy().to_string().as_str().into(),
+      locales_dir_path: cef_locales_dir
+        .to_string_lossy()
+        .to_string()
+        .as_str()
+        .into(),
       log_severity: cef::LogSeverity::VERBOSE,
       // Keep runtime writes outside the signed app bundle and installation directory.
-      log_file: cache_path.join("cef.log").to_string_lossy().to_string().as_str().into(),
+      log_file: cache_path
+        .join("cef.log")
+        .to_string_lossy()
+        .to_string()
+        .as_str()
+        .into(),
       ..Default::default()
     };
     let init_result = cef::initialize(
@@ -2201,6 +2279,8 @@ impl<T: UserEvent> CefRuntime<T> {
       context,
       event_tx,
       event_rx,
+      #[cfg(target_os = "macos")]
+      _library: _loader,
     }
   }
 }
@@ -2212,16 +2292,22 @@ pub fn run_cef_helper_process() {
 
   #[cfg(all(target_os = "macos", feature = "sandbox"))]
   let _sandbox = {
-    let mut sandbox = cef::sandbox::Sandbox::new();
-    sandbox.initialize(args.as_main_args());
-    sandbox
+    if macos_paths::helper_sandbox_enabled(std::env::args_os().skip(1)) {
+      let mut sandbox = cef::sandbox::Sandbox::new();
+      sandbox.initialize(args.as_main_args());
+      Some(sandbox)
+    } else {
+      None
+    }
   };
 
   #[cfg(target_os = "macos")]
   let _loader = {
-    let loader = cef::library_loader::LibraryLoader::new(&std::env::current_exe().unwrap(), true);
-    assert!(loader.load());
-    loader
+    let executable = std::env::current_exe().expect("CEF helper executable path");
+    let cef_path = std::env::var_os("CEF_PATH").map(PathBuf::from);
+    let framework = macos_paths::helper_framework(&executable, cef_path.as_deref())
+      .expect("CEF helper framework path");
+    MacCefLibrary::load(&framework)
   };
 
   cef::execute_process(
