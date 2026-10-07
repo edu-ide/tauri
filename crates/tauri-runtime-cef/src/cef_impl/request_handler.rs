@@ -18,7 +18,7 @@ use http::{
   HeaderMap, HeaderName, HeaderValue,
 };
 use kuchiki::NodeRef;
-use tauri_runtime::{webview::UriSchemeProtocolHandler, UserEvent};
+use tauri_runtime::{webview::{UriSchemeProtocolHandler, UriSchemeProtocolRequestOrigin}, UserEvent};
 use tauri_utils::{
   config::{Csp, CspDirectiveSources},
   html::{parse as parse_html, serialize_node},
@@ -528,6 +528,7 @@ wrap_request_handler! {
 wrap_resource_handler! {
   pub struct WebResourceHandler {
     webview_label: String,
+    caller_url: Option<Url>,
     handler: Arc<Box<UriSchemeProtocolHandler>>,
     initialization_scripts: Arc<Vec<CefInitScript>>,
     // we clone response to send it to the handler thread
@@ -596,6 +597,7 @@ wrap_resource_handler! {
 
         let data = read_request_body(request);
         let headers = get_request_headers(request);
+        let caller_url = self.caller_url.clone();
         let method_str = CefString::from(&request.method()).to_string();
         let method = http::Method::from_bytes(method_str.as_bytes())
           .unwrap_or(http::Method::GET);
@@ -603,6 +605,7 @@ wrap_resource_handler! {
         std::thread::spawn(move || {
           let mut http_request = http::Request::builder().method(method).uri(url.as_str()).body(data).unwrap();
           *http_request.headers_mut() = headers;
+          http_request.extensions_mut().insert(UriSchemeProtocolRequestOrigin(caller_url));
           // handler is Arc<Box<UriSchemeProtocol>>, so we need to dereference to call it
           (**handler)(&label, http_request, responder);
         });
@@ -690,7 +693,7 @@ wrap_scheme_handler_factory! {
     fn create(
       &self,
       browser: Option<&mut Browser>,
-      _frame: Option<&mut Frame>,
+      frame: Option<&mut Frame>,
       _scheme_name: Option<&CefString>,
       _request: Option<&mut Request>,
     ) -> Option<ResourceHandler> {
@@ -708,7 +711,12 @@ wrap_scheme_handler_factory! {
         })
       })?;
 
-      Some(WebResourceHandler::new(webview_label, handler, initialization_scripts, Arc::new(RefCell::new(None))))
+      // CEF supplies the initiating frame. Never substitute the main frame or
+      // a request header: a cross-origin child frame must keep its own identity.
+      let caller_url = frame.and_then(|frame| {
+        Url::parse(&CefString::from(&frame.url()).to_string()).ok()
+      });
+      Some(WebResourceHandler::new(webview_label, caller_url, handler, initialization_scripts, Arc::new(RefCell::new(None))))
     }
   }
 }

@@ -23,6 +23,13 @@ use std::{
   sync::Arc,
 };
 
+/// The initiating frame URL supplied by the native custom-protocol transport.
+///
+/// This is Rust-only request metadata, not a renderer-controlled HTTP header.
+/// `None` marks a transport that could not identify its caller and must fail closed.
+#[derive(Clone, Debug)]
+pub struct UriSchemeProtocolRequestOrigin(pub Option<Url>);
+
 pub type UriSchemeProtocolHandler = dyn Fn(&str, http::Request<Vec<u8>>, Box<dyn FnOnce(http::Response<Cow<'static, [u8]>>) + Send>)
   + Send
   + Sync

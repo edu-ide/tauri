@@ -488,15 +488,21 @@ fn parse_invoke_request<R: Runtime>(
     .map_err(|_| "Tauri invoke key header value must be a string")?
     .to_owned();
 
-  let url = Url::parse(
-    parts
-      .headers
-      .get("Origin")
-      .ok_or("missing Origin header")?
-      .to_str()
-      .map_err(|_| "Origin header value must be a string")?,
-  )
-  .map_err(|_| "Origin header is not a valid URL")?;
+  // CEF custom-protocol requests can have an opaque Origin header. Its native
+  // transport carries the actual initiating frame URL, including the path used
+  // by remote capabilities. Missing caller metadata fails closed.
+  let url = match parts.extensions.get::<tauri_runtime::webview::UriSchemeProtocolRequestOrigin>() {
+    Some(origin) => origin.0.clone().ok_or("missing native caller frame URL")?,
+    None => Url::parse(
+      parts
+        .headers
+        .get("Origin")
+        .ok_or("missing Origin header")?
+        .to_str()
+        .map_err(|_| "Origin header value must be a string")?,
+    )
+    .map_err(|_| "Origin header is not a valid URL")?,
+  };
 
   let callback = CallbackFn(
     parts
@@ -623,6 +629,31 @@ mod tests {
     assert_eq!(invoke_request.url, url.parse().unwrap());
     assert_eq!(invoke_request.headers, headers);
     assert_eq!(invoke_request.body, InvokeBody::Raw(body));
+
+    // Native frame identity must win over opaque or forged renderer headers.
+    let caller = Url::parse("http://127.0.0.1:18602/w/test-workspace").unwrap();
+    for origin_header in [None, Some("null"), Some("https://forged.example")] {
+      let mut native_request = Request::builder()
+        .uri(format!("ipc://localhost/{cmd}"))
+        .body(Vec::new()).unwrap();
+      *native_request.headers_mut() = headers.clone();
+      native_request.headers_mut().remove(ORIGIN);
+      if let Some(origin) = origin_header {
+        native_request.headers_mut().insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
+      }
+      native_request.extensions_mut().insert(
+        tauri_runtime::webview::UriSchemeProtocolRequestOrigin(Some(caller.clone()))
+      );
+      assert_eq!(super::parse_invoke_request(&manager, native_request).unwrap().url, caller);
+    }
+    let mut missing_frame = Request::builder()
+      .uri(format!("ipc://localhost/{cmd}"))
+      .body(Vec::new()).unwrap();
+    *missing_frame.headers_mut() = headers.clone();
+    missing_frame.extensions_mut().insert(
+      tauri_runtime::webview::UriSchemeProtocolRequestOrigin(None)
+    );
+    assert_eq!(super::parse_invoke_request(&manager, missing_frame).unwrap_err(), "missing native caller frame URL");
 
     let body = json!({
       "key": 1,
