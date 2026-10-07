@@ -33,12 +33,14 @@ impl CefBrowserExt for cef::Browser {
     }];
     unsafe { MapWindowPoints(Some(hwnd), GetParent(hwnd).ok(), position_point) };
 
-    cef::Rect {
+    // Callers work in DIP like the CEF Views and macOS paths; Win32 reports physical pixels.
+    let physical = cef::Rect {
       x: position_point[0].x,
       y: position_point[0].y,
       width: (rect.right - rect.left) as i32,
       height: (rect.bottom - rect.top) as i32,
-    }
+    };
+    scale_rect(&physical, 1.0 / self.scale_factor())
   }
 
   fn set_bounds(&self, rect: Option<&cef::Rect>) {
@@ -50,6 +52,9 @@ impl CefBrowserExt for cef::Browser {
       return;
     };
 
+    // `rect` is in DIP; SetWindowPos takes physical pixels. Without this a child browser at
+    // 200% display scaling fills only the top-left quarter of its window.
+    let rect = scale_rect(rect, self.scale_factor());
     let _ = unsafe {
       SetWindowPos(
         hwnd,
@@ -136,6 +141,24 @@ static GET_DPI_FOR_WINDOW: LazyLock<Option<GetDpiForWindow>> =
 static GET_DPI_FOR_MONITOR: LazyLock<Option<GetDpiForMonitor>> =
   LazyLock::new(|| get_function!("shcore.dll", GetDpiForMonitor));
 
+/// Converts a rect between DIP and physical pixels, rounding each edge so adjacent views
+/// that share an edge in one space still share it in the other.
+fn scale_rect(rect: &cef::Rect, factor: f64) -> cef::Rect {
+  if !factor.is_finite() || factor <= 0.0 || factor == 1.0 {
+    return rect.clone();
+  }
+  let left = (rect.x as f64 * factor).round() as i32;
+  let top = (rect.y as f64 * factor).round() as i32;
+  let right = ((rect.x + rect.width) as f64 * factor).round() as i32;
+  let bottom = ((rect.y + rect.height) as f64 * factor).round() as i32;
+  cef::Rect {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  }
+}
+
 pub const BASE_DPI: u32 = 96;
 pub fn dpi_to_scale_factor(dpi: u32) -> f64 {
   dpi as f64 / BASE_DPI as f64
@@ -182,5 +205,25 @@ pub unsafe fn hwnd_dpi(hwnd: HWND) -> u32 {
       // application and the WM.
       BASE_DPI
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn child_bounds_convert_between_dip_and_physical_pixels() {
+    let dip = cef::Rect { x: 264, y: 55, width: 880, height: 661 };
+    let physical = scale_rect(&dip, 2.0);
+    assert_eq!((physical.x, physical.y, physical.width, physical.height), (528, 110, 1760, 1322));
+    let back = scale_rect(&physical, 0.5);
+    assert_eq!((back.x, back.y, back.width, back.height), (264, 55, 880, 661));
+    // 150%: edges round independently so neighbours stay flush.
+    let left = scale_rect(&cef::Rect { x: 0, y: 0, width: 101, height: 10 }, 1.5);
+    let right = scale_rect(&cef::Rect { x: 101, y: 0, width: 99, height: 10 }, 1.5);
+    assert_eq!(left.x + left.width, right.x);
+    assert_eq!(scale_rect(&dip, 1.0).width, 880);
+    assert_eq!(scale_rect(&dip, f64::NAN).width, 880);
   }
 }
