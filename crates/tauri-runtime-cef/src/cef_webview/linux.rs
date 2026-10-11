@@ -35,16 +35,9 @@ impl CefBrowserExt for cef::Browser {
       return cef::Rect::default();
     };
 
-    let Some(xlib) = X11.as_ref() else {
-      return cef::Rect::default();
-    };
-
-    unsafe {
-      let display = (xlib.XOpenDisplay)(std::ptr::null());
-      if display.is_null() {
-        return cef::Rect::default();
-      }
-
+    // The stacking guard's connection: it also carries set_bounds, so this reads
+    // the geometry the host last asked for.
+    super::linux_stacking::with_display(|xlib, display| unsafe {
       let mut root: xlib::Window = 0;
       let mut x: i32 = 0;
       let mut y: i32 = 0;
@@ -65,8 +58,6 @@ impl CefBrowserExt for cef::Browser {
         &mut depth,
       );
 
-      (xlib.XCloseDisplay)(display);
-
       if status == 0 {
         return cef::Rect::default();
       }
@@ -78,7 +69,8 @@ impl CefBrowserExt for cef::Browser {
         width: width as i32,
         height: height as i32,
       }
-    }
+    })
+    .unwrap_or_default()
   }
 
   fn set_bounds(&self, rect: Option<&cef::Rect>) {
@@ -90,16 +82,7 @@ impl CefBrowserExt for cef::Browser {
       return;
     };
 
-    let Some(xlib) = X11.as_ref() else {
-      return;
-    };
-
-    unsafe {
-      let display = (xlib.XOpenDisplay)(std::ptr::null());
-      if display.is_null() {
-        return;
-      }
-
+    super::linux_stacking::with_display(|xlib, display| unsafe {
       (xlib.XMoveResizeWindow)(
         display,
         xid as xlib::Window,
@@ -112,8 +95,7 @@ impl CefBrowserExt for cef::Browser {
       // tab above chrome, and fights ANGLE's full-window surface so clicks
       // land on an ExposureMask-only child and do nothing.
       (xlib.XFlush)(display);
-      (xlib.XCloseDisplay)(display);
-    }
+    });
   }
 
   fn scale_factor(&self) -> f64 {
@@ -134,25 +116,16 @@ impl CefBrowserExt for cef::Browser {
       return;
     };
 
-    let Some(xlib) = X11.as_ref() else {
-      return;
-    };
-
-    unsafe {
-      let display = (xlib.XOpenDisplay)(std::ptr::null());
-      if display.is_null() {
-        return;
-      }
-
+    // Record first, so the guard's next pass judges the window by this request.
+    super::linux_stacking::set_requested_hidden(xid as xlib::Window, visible == 0);
+    super::linux_stacking::with_display(|xlib, display| unsafe {
       if visible != 0 {
         (xlib.XMapWindow)(display, xid as xlib::Window);
       } else {
         (xlib.XUnmapWindow)(display, xid as xlib::Window);
       }
       (xlib.XFlush)(display);
-      (xlib.XCloseDisplay)(display);
-    }
-    super::linux_stacking::set_requested_hidden(xid as xlib::Window, visible == 0);
+    });
   }
 
   fn close(&self) {
@@ -177,34 +150,7 @@ impl CefBrowserExt for cef::Browser {
       return;
     }
 
-    let Some(xlib) = X11.as_ref() else {
-      return;
-    };
-
-    unsafe {
-      let display = (xlib.XOpenDisplay)(std::ptr::null());
-      if display.is_null() {
-        return;
-      }
-
-      // Check if window exists before reparenting
-      let mut root: xlib::Window = 0;
-      let mut parent_window: xlib::Window = 0;
-      let mut children: *mut xlib::Window = std::ptr::null_mut();
-      let mut nchildren: u32 = 0;
-      let status = (xlib.XQueryTree)(
-        display,
-        xid as xlib::Window,
-        &mut root,
-        &mut parent_window,
-        &mut children,
-        &mut nchildren,
-      );
-
-      if status != 0 && !children.is_null() {
-        (xlib.XFree)(children as *mut std::ffi::c_void);
-      }
-
+    super::linux_stacking::with_display(|xlib, display| unsafe {
       (xlib.XReparentWindow)(
         display,
         xid as xlib::Window,
@@ -217,8 +163,7 @@ impl CefBrowserExt for cef::Browser {
       // so the content hole stayed white (2026-09-16).
       (xlib.XMapWindow)(display, xid as xlib::Window);
       (xlib.XFlush)(display);
-      (xlib.XCloseDisplay)(display);
-    }
+    });
     super::linux_stacking::register(parent_xid as xlib::Window, xid as xlib::Window);
   }
 }

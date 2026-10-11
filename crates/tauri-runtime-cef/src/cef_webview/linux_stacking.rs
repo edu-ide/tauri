@@ -66,10 +66,10 @@ pub(super) fn unregister(child: xlib::Window) {
   });
 }
 
-/// Record whether the host asked for `child` to be hidden. Chromium maps a new
-/// browser's X window on its own once the window is ready, which can land after
-/// the host's hide (a tab created under an overlay, then the overlay closed and
-/// reopened quickly), so a hidden child that becomes viewable is unmapped again.
+/// Record whether the host asked for `child` to be hidden. A hidden child that
+/// becomes viewable anyway is unmapped again on the next pass. With the host's
+/// requests on one connection (`with_display`) this should not happen; the log
+/// line in `keep_hidden` shows when it does.
 pub(super) fn set_requested_hidden(child: xlib::Window, hidden: bool) {
   if child <= 1 {
     return;
@@ -87,6 +87,23 @@ pub(super) fn set_requested_hidden(child: xlib::Window, hidden: bool) {
       }
     }
   });
+}
+
+/// Run `f` on the guard's own connection. The host's map, unmap and geometry
+/// requests used to go out on a fresh connection each, and the X server orders
+/// requests only within a connection: a show and the hide that followed it could
+/// be applied the other way round, leaving a tab mapped over an overlay for a
+/// frame, and a move could land after the resize meant to follow it.
+pub(super) fn with_display<R>(f: impl FnOnce(&xlib::Xlib, *mut xlib::Display) -> R) -> Option<R> {
+  let xlib = X11.as_ref()?;
+  let display = GUARD.with(|guard| {
+    let mut guard = guard.borrow_mut();
+    if guard.is_none() {
+      *guard = ChildStackingGuard::new();
+    }
+    guard.as_ref().map(|guard| guard.display)
+  })?;
+  Some(f(xlib, display))
 }
 
 pub(crate) fn process_events() {
@@ -207,12 +224,15 @@ impl ChildStackingGuard {
     }
   }
 
-  /// Unmap any browser window the host hid that has since become viewable.
+  /// Unmap any browser window the host hid that has since become viewable. Each
+  /// repair is logged; a window remapped every frame would log every frame, which
+  /// is itself the bug to find.
   unsafe fn keep_hidden(&mut self, xlib: &xlib::Xlib) {
     let mut unmapped = false;
     for &window in &self.hidden {
       if is_viewable(xlib, self.display, window) {
         (xlib.XUnmapWindow)(self.display, window);
+        eprintln!("[tauri-cef] hidden browser window {window} was mapped; unmapped it again");
         unmapped = true;
       }
     }
