@@ -118,14 +118,23 @@ impl CefBrowserExt for cef::Browser {
 
     // Record first, so the guard's next pass judges the window by this request.
     super::linux_stacking::set_requested_hidden(xid as xlib::Window, visible == 0);
-    super::linux_stacking::with_display(|xlib, display| unsafe {
+    let uncovered = super::linux_stacking::with_display(|xlib, display| unsafe {
       if visible != 0 {
         (xlib.XMapWindow)(display, xid as xlib::Window);
-      } else {
-        (xlib.XUnmapWindow)(display, xid as xlib::Window);
+        (xlib.XFlush)(display);
+        return false;
       }
+      // Only a window that was on screen leaves an area for the shell to repaint.
+      let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
+      let shown = (xlib.XGetWindowAttributes)(display, xid as xlib::Window, &mut attrs) != 0
+        && attrs.map_state == xlib::IsViewable;
+      (xlib.XUnmapWindow)(display, xid as xlib::Window);
       (xlib.XFlush)(display);
+      shown
     });
+    if uncovered == Some(true) {
+      super::linux_stacking::expose_uncovered(xid as xlib::Window);
+    }
   }
 
   fn close(&self) {

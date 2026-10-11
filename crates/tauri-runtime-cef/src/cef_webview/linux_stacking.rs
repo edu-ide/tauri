@@ -106,6 +106,21 @@ pub(super) fn with_display<R>(f: impl FnOnce(&xlib::Xlib, *mut xlib::Display) ->
   Some(f(xlib, display))
 }
 
+/// Ask the browsers `child` was covering to repaint that area, after the host
+/// unmapped it. The shell paints through ANGLE's child surface, so the X server
+/// sends the Expose for the uncovered area to ANGLE in the GPU process, which
+/// drops it; the area stayed black, or kept the hidden page's last pixels, until
+/// the shell drew its next frame for some other reason (2026-10-11, Agent Browser
+/// overlay-composition stage 13: tab windows all unmapped, page pixels on screen).
+pub(super) fn expose_uncovered(child: xlib::Window) {
+  let Some(xlib) = X11.as_ref() else { return };
+  GUARD.with(|guard| {
+    if let Some(guard) = guard.borrow_mut().as_mut() {
+      unsafe { guard.expose_uncovered(xlib, child) };
+    }
+  });
+}
+
 pub(crate) fn process_events() {
   GUARD.with(|guard| {
     if let Some(guard) = guard.borrow_mut().as_mut() {
@@ -170,6 +185,49 @@ impl ChildStackingGuard {
       }
     }
     children.insert(child);
+  }
+
+  fn parent_of(&self, child: xlib::Window) -> Option<xlib::Window> {
+    self
+      .parents
+      .iter()
+      .find(|(_, children)| children.contains(&child))
+      .map(|(parent, _)| *parent)
+  }
+
+  /// Send each viewable registered sibling an Expose for the part of `child`'s area it lies under.
+  unsafe fn expose_uncovered(&mut self, xlib: &xlib::Xlib, child: xlib::Window) {
+    let Some(parent) = self.parent_of(child) else { return };
+    let Some(siblings) = self.parents.get(&parent) else { return };
+    let mut hidden: xlib::XWindowAttributes = std::mem::zeroed();
+    if (xlib.XGetWindowAttributes)(self.display, child, &mut hidden) == 0 {
+      return;
+    }
+    let area = Area { x: hidden.x, y: hidden.y, width: hidden.width, height: hidden.height };
+    let mut sent = false;
+    for &sibling in siblings.iter().filter(|&&w| w != child) {
+      let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
+      if (xlib.XGetWindowAttributes)(self.display, sibling, &mut attrs) == 0
+        || attrs.map_state != xlib::IsViewable
+      {
+        continue;
+      }
+      let under = Area { x: attrs.x, y: attrs.y, width: attrs.width, height: attrs.height };
+      let Some(damage) = uncovered_in(area, under) else { continue };
+      let mut expose: xlib::XExposeEvent = std::mem::zeroed();
+      expose.type_ = xlib::Expose;
+      expose.window = sibling;
+      expose.x = damage.x;
+      expose.y = damage.y;
+      expose.width = damage.width;
+      expose.height = damage.height;
+      let mut event = xlib::XEvent { expose };
+      (xlib.XSendEvent)(self.display, sibling, xlib::False, xlib::ExposureMask, &mut event);
+      sent = true;
+    }
+    if sent {
+      (xlib.XFlush)(self.display);
+    }
   }
 
   fn forget_child(&mut self, child: xlib::Window) {
@@ -336,6 +394,29 @@ impl ChildStackingGuard {
     // the parent then, try once more after the cooldown.
     self.recheck_at = Some(Instant::now() + HANDOFF_COOLDOWN);
   }
+}
+
+/// A rectangle in some window's coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Area {
+  x: i32,
+  y: i32,
+  width: i32,
+  height: i32,
+}
+
+/// The part of `hidden` (in parent coordinates) that lies over `under`, in `under`'s own coordinates.
+fn uncovered_in(hidden: Area, under: Area) -> Option<Area> {
+  let left = hidden.x.max(under.x);
+  let top = hidden.y.max(under.y);
+  let right = (hidden.x + hidden.width).min(under.x + under.width);
+  let bottom = (hidden.y + hidden.height).min(under.y + under.height);
+  (right > left && bottom > top).then(|| Area {
+    x: left - under.x,
+    y: top - under.y,
+    width: right - left,
+    height: bottom - top,
+  })
 }
 
 /// Which browser gets focus that landed on its parent.
@@ -769,6 +850,22 @@ mod tests {
     assert_eq!(handoff_target(None, None, Some(1), Some(4)), Some(1));
     assert_eq!(handoff_target(None, None, None, Some(4)), Some(4));
     assert_eq!(handoff_target(None, None, None, None), None);
+  }
+
+  #[test]
+  fn hidden_tab_area_is_exposed_in_the_shell_coordinates() {
+    let shell = Area { x: 0, y: 0, width: 1120, height: 780 };
+    let tab = Area { x: 0, y: 84, width: 1120, height: 696 };
+    assert_eq!(uncovered_in(tab, shell), Some(tab));
+    // A sibling offset inside the parent gets the overlap in its own coordinates.
+    let panel = Area { x: 800, y: 0, width: 320, height: 780 };
+    assert_eq!(
+      uncovered_in(tab, panel),
+      Some(Area { x: 0, y: 84, width: 320, height: 696 })
+    );
+    // Siblings that do not overlap get nothing.
+    let strip = Area { x: 0, y: 0, width: 1120, height: 84 };
+    assert_eq!(uncovered_in(tab, strip), None);
   }
 
   #[test]
