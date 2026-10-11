@@ -61,6 +61,30 @@ pub(super) fn unregister(child: xlib::Window) {
   GUARD.with(|guard| {
     if let Some(guard) = guard.borrow_mut().as_mut() {
       guard.forget_child(child);
+      guard.hidden.remove(&child);
+    }
+  });
+}
+
+/// Record whether the host asked for `child` to be hidden. Chromium maps a new
+/// browser's X window on its own once the window is ready, which can land after
+/// the host's hide (a tab created under an overlay, then the overlay closed and
+/// reopened quickly), so a hidden child that becomes viewable is unmapped again.
+pub(super) fn set_requested_hidden(child: xlib::Window, hidden: bool) {
+  if child <= 1 {
+    return;
+  }
+  GUARD.with(|guard| {
+    let mut guard = guard.borrow_mut();
+    if guard.is_none() {
+      *guard = ChildStackingGuard::new();
+    }
+    if let Some(guard) = guard.as_mut() {
+      if hidden {
+        guard.hidden.insert(child);
+      } else {
+        guard.hidden.remove(&child);
+      }
     }
   });
 }
@@ -86,6 +110,8 @@ struct ChildStackingGuard {
   last_handoff: Option<Instant>,
   /// Popup windows to bring forward once shown, each until its deadline.
   present: Vec<(xlib::Window, Instant)>,
+  /// Browser windows the host asked to hide; they must not stay mapped.
+  hidden: HashSet<xlib::Window>,
 }
 
 /// Something that keeps pulling focus back to the parent gets one handoff per this long, not a fight every frame.
@@ -107,6 +133,7 @@ impl ChildStackingGuard {
       recheck_at: None,
       last_handoff: None,
       present: Vec::new(),
+      hidden: HashSet::new(),
     })
   }
 
@@ -152,6 +179,7 @@ impl ChildStackingGuard {
           xlib::DestroyNotify => {
             self.parents.remove(&event.destroy_window.window);
             self.forget_child(event.destroy_window.window);
+            self.hidden.remove(&event.destroy_window.window);
           }
           xlib::ReparentNotify => {
             let event = event.reparent;
@@ -173,8 +201,23 @@ impl ChildStackingGuard {
       for (parent, children) in parents {
         let _ = repair_parent(xlib, self.display, parent, &children);
       }
+      self.keep_hidden(xlib);
       self.follow_focus(xlib);
       self.present_shown(xlib);
+    }
+  }
+
+  /// Unmap any browser window the host hid that has since become viewable.
+  unsafe fn keep_hidden(&mut self, xlib: &xlib::Xlib) {
+    let mut unmapped = false;
+    for &window in &self.hidden {
+      if is_viewable(xlib, self.display, window) {
+        (xlib.XUnmapWindow)(self.display, window);
+        unmapped = true;
+      }
+    }
+    if unmapped {
+      (xlib.XFlush)(self.display);
     }
   }
 

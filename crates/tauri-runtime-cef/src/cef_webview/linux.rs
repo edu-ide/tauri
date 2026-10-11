@@ -152,6 +152,7 @@ impl CefBrowserExt for cef::Browser {
       (xlib.XFlush)(display);
       (xlib.XCloseDisplay)(display);
     }
+    super::linux_stacking::set_requested_hidden(xid as xlib::Window, visible == 0);
   }
 
   fn close(&self) {
