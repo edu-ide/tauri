@@ -2,6 +2,9 @@ use cef::*;
 use std::sync::LazyLock;
 
 use crate::cef_webview::CefBrowserExt;
+
+#[path = "window_visibility.rs"]
+mod window_visibility;
 use windows::{
   core::{HRESULT, HSTRING, PCSTR},
   Win32::{
@@ -86,8 +89,7 @@ impl CefBrowserExt for cef::Browser {
       return;
     };
 
-    let cmd = if visible != 0 { SW_SHOW } else { SW_HIDE };
-    let _ = unsafe { ShowWindow(hwnd, cmd) };
+    window_visibility::set_window_visible(hwnd, visible != 0);
   }
 
   fn close(&self) {
